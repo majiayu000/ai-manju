@@ -730,6 +730,62 @@ class TestE2EPipelineMock:
         assert persisted.get_all_shots()[0].video_path is None
 
     @pytest.mark.asyncio
+    async def test_failed_image_regen_clears_stale_image_path(self, monkeypatch, tmp_path):
+        """Failed image regenerations must clear prior image_path before storyboard persist."""
+        from src.modules.image_gen.generator import ImageGeneratorModule, ImageGenInput
+        from src.models.shot import Shot, Storyboard, EpisodeStoryboard
+
+        stale = tmp_path / "stale.png"
+        stale.write_bytes(b"old image")
+        sb_path = tmp_path / "storyboard.json"
+
+        shot = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="regen",
+            duration=5.0,
+            image_path=str(stale),
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_clear_image",
+            episode_id=1,
+            scenes=[
+                Storyboard(
+                    project_id="proj_clear_image",
+                    episode_id=1,
+                    scene_id=1,
+                    shots=[shot],
+                )
+            ],
+        )
+        sb_path.write_text(storyboard.model_dump_json())
+
+        class BoomProvider:
+            async def generate_and_wait(self, **kwargs):
+                raise RuntimeError("provider down")
+
+        monkeypatch.setattr(
+            "src.modules.image_gen.generator.get_kling_provider",
+            lambda mock=False: BoomProvider(),
+        )
+
+        module = ImageGeneratorModule()
+        output = await module.process(
+            ImageGenInput(
+                project_id="proj_clear_image",
+                storyboard=storyboard,
+                storyboard_path=str(sb_path),
+                mock_mode=True,
+            )
+        )
+
+        assert shot.image_path is None
+        assert 1 in output.failed_shots
+        persisted = EpisodeStoryboard.model_validate_json(sb_path.read_text())
+        assert persisted.get_all_shots()[0].image_path is None
+
+    @pytest.mark.asyncio
     async def test_full_pipeline_persists_failed_stage_status(self, monkeypatch, tmp_path):
         """Full-pipeline stage failure must persist ProjectStatus.FAILED before return."""
         from src.pipeline.controller import PipelineStage

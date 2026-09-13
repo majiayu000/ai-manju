@@ -93,6 +93,11 @@ class ImageGeneratorModule(BaseModule[ImageGenInput, ImageGenOutput]):
 
             self.logger.info(f"需要生成 {len(shots_to_process)} 张图像")
 
+            # Clear prior image_path before regeneration so a failed shot cannot
+            # leave a stale keyframe that video synthesis would silently reuse.
+            for shot in shots_to_process:
+                shot.image_path = None
+
             # 并发生成（限制并发数）
             generated_images = []
             image_paths = []
@@ -122,6 +127,7 @@ class ImageGeneratorModule(BaseModule[ImageGenInput, ImageGenOutput]):
                 for shot, result in zip(batch, results):
                     if isinstance(result, Exception):
                         self.logger.error(f"镜头 {shot.shot_id} 生成失败: {result}")
+                        shot.image_path = None
                         failed_shots.append(shot.shot_id)
                     else:
                         generated_images.append(result["info"])
