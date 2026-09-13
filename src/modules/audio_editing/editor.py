@@ -120,7 +120,25 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
                     failed_shots=failed_shots,
                 )
 
-            # 合成最终视频 — prefer shot.video_path (shot-keyed) over an unkeyed list
+            # 合成最终视频 — prefer shot.video_path (shot-keyed) over an unkeyed list.
+            # A non-null but missing path is a hard failure: do not silently drop
+            # shots and compose an incomplete episode.
+            missing_clip_shots = [
+                s.shot_id
+                for s in all_shots
+                if s.video_path and not Path(s.video_path).exists()
+            ]
+            if missing_clip_shots:
+                return AudioEditingOutput(
+                    success=False,
+                    error=f"镜头视频文件缺失，无法合成: {missing_clip_shots}",
+                    audio_files=audio_files,
+                    total_duration=total_duration,
+                    failed_shots=failed_shots + [
+                        sid for sid in missing_clip_shots if sid not in failed_shots
+                    ],
+                )
+
             final_video_path = None
             shot_video_segments = [
                 (s, s.video_path)

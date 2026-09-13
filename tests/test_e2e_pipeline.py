@@ -236,6 +236,246 @@ class TestE2EPipelineMock:
         assert VideoSynthModule._normalize_kling_duration(5.0) == 5
 
     @pytest.mark.asyncio
+    async def test_generate_shot_video_retimes_to_storyboard_duration(self, monkeypatch, tmp_path):
+        """Provider-rounded clips must be retimed back to shot.duration."""
+        from src.modules.video_synth.synthesizer import VideoSynthModule
+        from src.models.shot import Shot
+
+        calls = []
+
+        class FakeProvider:
+            async def image_to_video_and_wait(self, **kwargs):
+                calls.append(kwargs)
+                return {"video_url": "https://placeholder/clip.mp4", "duration": 5}
+
+        async def fake_download(self, url, save_path):
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            # Non-mock bytes so retime path is exercised (then stubbed).
+            save_path.write_bytes(b"real-ish video bytes that are not mock")
+
+        retime_calls = []
+
+        async def fake_retime(self, path, provider_duration, target_duration):
+            retime_calls.append(
+                {
+                    "path": str(path),
+                    "provider_duration": provider_duration,
+                    "target_duration": target_duration,
+                }
+            )
+
+        monkeypatch.setattr(VideoSynthModule, "_download_video", fake_download)
+        monkeypatch.setattr(VideoSynthModule, "_retime_clip_to_duration", fake_retime)
+
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"img")
+        shot = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="timed",
+            duration=6.7,
+            image_path=str(img),
+        )
+
+        module = VideoSynthModule()
+        result = await module._generate_shot_video(
+            shot=shot,
+            provider=FakeProvider(),
+            project_id="proj_retime",
+            duration=5,
+            mode="std",
+            target_duration=6.7,
+        )
+
+        assert calls[0]["duration"] == 5
+        assert retime_calls == [
+            {
+                "path": result["path"],
+                "provider_duration": 5.0,
+                "target_duration": 6.7,
+            }
+        ]
+        assert result["info"]["duration"] == 6.7
+        assert result["info"]["provider_duration"] == 5.0
+
+    @pytest.mark.asyncio
+    async def test_missing_image_clears_stale_video_path_before_filter(self, monkeypatch, tmp_path):
+        """Shots without a current image must still clear stale video_path and persist."""
+        from src.modules.video_synth.synthesizer import VideoSynthModule, VideoSynthInput
+        from src.models.shot import Shot, Storyboard, EpisodeStoryboard
+
+        stale = tmp_path / "stale.mp4"
+        stale.write_bytes(b"old clip")
+        sb_path = tmp_path / "storyboard.json"
+
+        missing_image = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="no image",
+            duration=5.0,
+            image_path=str(tmp_path / "gone.png"),
+            video_path=str(stale),
+        )
+        ok_img = tmp_path / "ok.png"
+        ok_img.write_bytes(b"img")
+        ok_stale = tmp_path / "ok_stale.mp4"
+        ok_stale.write_bytes(b"other old")
+        with_image = Shot(
+            shot_id=2,
+            episode_id=1,
+            scene_id=1,
+            description="has image",
+            duration=5.0,
+            image_path=str(ok_img),
+            video_path=str(ok_stale),
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_clear_before_filter",
+            episode_id=1,
+            scenes=[
+                Storyboard(
+                    project_id="proj_clear_before_filter",
+                    episode_id=1,
+                    scene_id=1,
+                    shots=[missing_image, with_image],
+                )
+            ],
+        )
+        sb_path.write_text(storyboard.model_dump_json())
+
+        class OkProvider:
+            async def image_to_video_and_wait(self, **kwargs):
+                return {"video_url": "https://placeholder/ok.mp4", "duration": 5}
+
+        monkeypatch.setattr(
+            "src.modules.video_synth.synthesizer.get_kling_video_provider",
+            lambda mock=False: OkProvider(),
+        )
+
+        module = VideoSynthModule()
+        output = await module.process(
+            VideoSynthInput(
+                project_id="proj_clear_before_filter",
+                storyboard=storyboard,
+                storyboard_path=str(sb_path),
+                mock_mode=True,
+            )
+        )
+
+        assert output.success is True
+        assert missing_image.video_path is None
+        assert with_image.video_path is not None
+        persisted = EpisodeStoryboard.model_validate_json(sb_path.read_text())
+        shots = {s.shot_id: s for s in persisted.get_all_shots()}
+        assert shots[1].video_path is None
+
+    @pytest.mark.asyncio
+    async def test_no_images_persists_cleared_stale_video_paths(self, monkeypatch, tmp_path):
+        """Early failure with no usable images must still persist cleared video_path."""
+        from src.modules.video_synth.synthesizer import VideoSynthModule, VideoSynthInput
+        from src.models.shot import Shot, Storyboard, EpisodeStoryboard
+
+        stale = tmp_path / "stale.mp4"
+        stale.write_bytes(b"old clip")
+        sb_path = tmp_path / "storyboard.json"
+        shot = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="gone",
+            duration=5.0,
+            image_path=str(tmp_path / "missing.png"),
+            video_path=str(stale),
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_clear_early",
+            episode_id=1,
+            scenes=[
+                Storyboard(
+                    project_id="proj_clear_early",
+                    episode_id=1,
+                    scene_id=1,
+                    shots=[shot],
+                )
+            ],
+        )
+        sb_path.write_text(storyboard.model_dump_json())
+
+        monkeypatch.setattr(
+            "src.modules.video_synth.synthesizer.get_kling_video_provider",
+            lambda mock=False: object(),
+        )
+
+        module = VideoSynthModule()
+        output = await module.process(
+            VideoSynthInput(
+                project_id="proj_clear_early",
+                storyboard=storyboard,
+                storyboard_path=str(sb_path),
+                mock_mode=True,
+            )
+        )
+
+        assert output.success is False
+        assert shot.video_path is None
+        persisted = EpisodeStoryboard.model_validate_json(sb_path.read_text())
+        assert persisted.get_all_shots()[0].video_path is None
+
+    @pytest.mark.asyncio
+    async def test_audio_compose_fails_when_expected_clip_missing(self, tmp_path):
+        """Non-null missing video_path must fail composition instead of dropping the shot."""
+        from src.modules.audio_editing.editor import AudioEditingModule, AudioEditingInput
+        from src.models.shot import Shot, Storyboard, EpisodeStoryboard
+
+        present = tmp_path / "ok.mp4"
+        present.write_bytes(b"mock video data")
+        shot_ok = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="ok",
+            duration=5.0,
+            video_path=str(present),
+        )
+        shot_missing = Shot(
+            shot_id=2,
+            episode_id=1,
+            scene_id=1,
+            description="missing",
+            duration=5.0,
+            video_path=str(tmp_path / "gone.mp4"),
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_missing_clip",
+            episode_id=1,
+            scenes=[
+                Storyboard(
+                    project_id="proj_missing_clip",
+                    episode_id=1,
+                    scene_id=1,
+                    shots=[shot_ok, shot_missing],
+                )
+            ],
+        )
+
+        module = AudioEditingModule()
+        output = await module.process(
+            AudioEditingInput(
+                project_id="proj_missing_clip",
+                storyboard=storyboard,
+                mock_mode=True,
+                add_bgm=False,
+            )
+        )
+
+        assert output.success is False
+        assert "缺失" in (output.error or "")
+        assert 2 in output.failed_shots
+        assert output.final_video_path is None
+
+    @pytest.mark.asyncio
     async def test_mock_audio_compose_skips_ffmpeg(self, monkeypatch, tmp_path):
         """Mock composition must write a placeholder final video without FFmpeg."""
         from src.modules.audio_editing.editor import AudioEditingModule
@@ -275,10 +515,9 @@ class TestE2EPipelineMock:
             shot_video_segments=[(shot, str(clip))],
             mock_mode=True,
         )
-
-        assert calls == []
         assert Path(result).exists()
         assert Path(result).read_bytes() == b"mock final video data"
+        assert calls == []
 
     @pytest.mark.asyncio
     async def test_video_audio_stages_propagate_quality_score(self, monkeypatch):

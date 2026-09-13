@@ -96,21 +96,27 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
             else:
                 shots_to_process = all_shots
 
+            # Clear stale video_path on every selected shot BEFORE the image
+            # filter so a missing/deleted keyframe cannot keep prior footage
+            # that audio editing would silently compose on a partial rerun.
+            for shot in shots_to_process:
+                shot.video_path = None
+
             # 只处理有图像的镜头
             shots_with_images = [s for s in shots_to_process if s.image_path and Path(s.image_path).exists()]
 
             if not shots_with_images:
+                if input_data.storyboard_path and storyboard:
+                    await self.file_handler.write_json(
+                        input_data.storyboard_path,
+                        storyboard.model_dump(mode="json"),
+                    )
                 return VideoSynthOutput(
                     success=False,
                     error="没有找到可用的图像文件"
                 )
 
             self.logger.info(f"需要生成 {len(shots_with_images)} 个视频片段")
-
-            # Clear prior video_path before regeneration so a failed shot cannot
-            # leave a stale clip that audio editing would silently compose.
-            for shot in shots_with_images:
-                shot.video_path = None
 
             # 生成视频
             generated_videos = []
@@ -122,6 +128,8 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
                 try:
                     # Prefer per-shot storyboard duration over the input default,
                     # then map to Kling-supported 5s/10s before the provider call.
+                    # After download, retime the clip back to shot_duration so
+                    # provider rounding does not shorten the episode timeline.
                     shot_duration = shot.duration if shot.duration else input_data.duration_per_shot
                     provider_duration = self._normalize_kling_duration(shot_duration)
                     result = await self._generate_shot_video(
@@ -129,7 +137,8 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
                         provider=provider,
                         project_id=input_data.project_id,
                         duration=provider_duration,
-                        mode=input_data.mode
+                        mode=input_data.mode,
+                        target_duration=float(shot_duration),
                     )
                     generated_videos.append(result["info"])
                     video_paths.append(result["path"])
@@ -200,7 +209,8 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
         provider,
         project_id: str,
         duration: float,
-        mode: str
+        mode: str,
+        target_duration: Optional[float] = None,
     ) -> dict:
         """生成单个镜头的视频"""
         # 读取图像并转为Base64或使用URL
@@ -241,6 +251,17 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
 
         await self._download_video(video_url, save_path)
 
+        storyboard_duration = (
+            float(target_duration)
+            if target_duration is not None
+            else float(duration)
+        )
+        await self._retime_clip_to_duration(
+            save_path,
+            provider_duration=float(duration),
+            target_duration=storyboard_duration,
+        )
+
         # 更新镜头信息
         shot.video_path = str(save_path)
 
@@ -250,10 +271,87 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
                 "episode_id": shot.episode_id,
                 "scene_id": shot.scene_id,
                 "video_url": video_url,
-                "duration": result.get("duration", duration)
+                "duration": storyboard_duration,
+                "provider_duration": float(duration),
             },
             "path": str(save_path)
         }
+
+    async def _retime_clip_to_duration(
+        self,
+        path: Path,
+        provider_duration: float,
+        target_duration: float,
+    ) -> None:
+        """Speed-adjust a Kling clip so its timeline matches storyboard duration."""
+        if target_duration <= 0 or provider_duration <= 0:
+            return
+        if abs(provider_duration - target_duration) < 1e-3:
+            return
+
+        # Mock placeholders are not real media; keep bytes and skip FFmpeg.
+        marker = b"mock video data"
+        try:
+            if path.exists() and path.stat().st_size == len(marker):
+                with path.open("rb") as f:
+                    if f.read(len(marker)) == marker:
+                        return
+        except OSError:
+            return
+
+        import subprocess
+        import tempfile
+
+        # setpts factor > 1 slows video (stretch); < 1 speeds it up.
+        pts_factor = provider_duration / target_duration
+        # atempo is inverse of PTS stretch and must stay within [0.5, 2.0].
+        tempo = target_duration / provider_duration
+        tempo_filters = []
+        remaining = tempo
+        while remaining > 2.0 + 1e-9:
+            tempo_filters.append("atempo=2.0")
+            remaining /= 2.0
+        while remaining < 0.5 - 1e-9:
+            tempo_filters.append("atempo=0.5")
+            remaining /= 0.5
+        tempo_filters.append(f"atempo={remaining:.6f}")
+        audio_chain = ",".join(tempo_filters)
+
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+
+        # Prefer A/V retiming; fall back to video-only when the clip has no audio.
+        cmd_av = [
+            "ffmpeg", "-y",
+            "-i", str(path),
+            "-filter_complex",
+            f"[0:v]setpts={pts_factor:.6f}*PTS[v];[0:a]{audio_chain}[a]",
+            "-map", "[v]",
+            "-map", "[a]",
+            str(tmp_path),
+        ]
+        cmd_v = [
+            "ffmpeg", "-y",
+            "-i", str(path),
+            "-filter:v", f"setpts={pts_factor:.6f}*PTS",
+            "-an",
+            str(tmp_path),
+        ]
+
+        try:
+            proc = subprocess.run(cmd_av, capture_output=True)
+            if proc.returncode != 0:
+                proc = subprocess.run(cmd_v, capture_output=True)
+                if proc.returncode != 0:
+                    err = (proc.stderr or b"").decode(errors="replace")
+                    raise RuntimeError(f"FFmpeg retime failed: {err}")
+            path.write_bytes(tmp_path.read_bytes())
+            self.logger.debug(
+                f"已将片段重定时到 {target_duration}s (provider={provider_duration}s): {path}"
+            )
+        finally:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
     def _build_motion_prompt(self, shot: Shot) -> str:
         """构建运动描述提示词"""
