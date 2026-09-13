@@ -1,6 +1,7 @@
 """
 Regression tests for LFI via ip_content_path on POST /api/projects.
 """
+import os
 from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -67,12 +68,50 @@ class TestCopyUnderRootNoFollow:
             copy_under_root(link, inputs_dir, dest)
         assert not dest.exists()
 
+    def test_rejects_parent_directory_symlink_to_outside(self, inputs_dir, tmp_path):
+        """Intermediate dirs must not be followable via symlink swap (openat walk)."""
+        import shutil
+
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (outside / "file.txt").write_text("SECRET=1", encoding="utf-8")
+
+        nested = inputs_dir / "nested"
+        nested.mkdir()
+        (nested / "file.txt").write_text("safe", encoding="utf-8")
+        # Replace nested directory with a symlink to an outside directory.
+        shutil.rmtree(nested)
+        nested.symlink_to(outside)
+
+        dest = tmp_path / "out" / "file.txt"
+        with pytest.raises(UnsafePathError):
+            copy_under_root(inputs_dir / "nested" / "file.txt", inputs_dir, dest)
+        assert not dest.exists()
+
+    def test_fails_closed_without_o_nofollow(self, inputs_dir, tmp_path, monkeypatch):
+        src = inputs_dir / "story.txt"
+        src.write_text("safe", encoding="utf-8")
+        dest = tmp_path / "out" / "story.txt"
+        monkeypatch.delattr(os, "O_NOFOLLOW", raising=False)
+        with pytest.raises(UnsafePathError, match="O_NOFOLLOW"):
+            copy_under_root(src, inputs_dir, dest)
+        assert not dest.exists()
+
     def test_copies_regular_file(self, inputs_dir, tmp_path):
         src = inputs_dir / "story.txt"
         src.write_text("safe", encoding="utf-8")
         dest = tmp_path / "out" / "story.txt"
         copied = copy_under_root(src, inputs_dir, dest)
         assert copied.read_text(encoding="utf-8") == "safe"
+
+    def test_copies_nested_regular_file(self, inputs_dir, tmp_path):
+        nested = inputs_dir / "a" / "b"
+        nested.mkdir(parents=True)
+        src = nested / "story.txt"
+        src.write_text("nested-safe", encoding="utf-8")
+        dest = tmp_path / "out" / "story.txt"
+        copied = copy_under_root(src, inputs_dir, dest)
+        assert copied.read_text(encoding="utf-8") == "nested-safe"
 
 
 class TestCreateProjectPathPolicy:
