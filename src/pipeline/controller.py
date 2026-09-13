@@ -536,6 +536,8 @@ class PipelineController:
         all_failed = []
         all_video_paths = []
         episode_results = []
+        quality_scores = []
+        quality_details = {}
 
         for sb_path in storyboard_paths:
             input_data = VideoSynthInput(
@@ -561,6 +563,11 @@ class PipelineController:
                     "video_paths": list(output.video_paths or []),
                     "merged_video_path": output.merged_video_path,
                 })
+                quality = getattr(output, "quality", None)
+                if quality:
+                    quality_scores.append(quality.score)
+                    if quality.details:
+                        quality_details[sb_path] = quality.details
 
         # Module may report success=True with empty video_paths when every clip fails.
         has_clips = all(
@@ -574,6 +581,9 @@ class PipelineController:
             and has_clips
             and total_generated > 0
         )
+        quality_score = (
+            sum(quality_scores) / len(quality_scores) if quality_scores else None
+        )
 
         if success:
             project.update_status(ProjectStatus.VIDEO_DONE)
@@ -583,6 +593,8 @@ class PipelineController:
                 "video_paths": all_video_paths,
                 "episode_results": episode_results,
             })
+            if quality_score is not None:
+                project.set_quality_score("video_synth", quality_score, quality_details)
 
         error = None
         if not success:
@@ -597,6 +609,7 @@ class PipelineController:
             "total_generated": total_generated,
             "failed_count": len(all_failed),
             "video_paths": all_video_paths,
+            "quality_score": quality_score,
         }
 
     async def _run_audio_editing(self, project: Project) -> dict:
@@ -620,6 +633,8 @@ class PipelineController:
         all_failed = []
         final_video_paths = []
         total_duration = 0.0
+        quality_scores = []
+        quality_details = {}
 
         for sb_path in storyboard_paths:
             # Do not pass a filtered unkeyed video_paths list — AudioEditingModule
@@ -644,6 +659,11 @@ class PipelineController:
                 total_duration += output.total_duration or 0.0
                 if output.final_video_path:
                     final_video_paths.append(output.final_video_path)
+                quality = getattr(output, "quality", None)
+                if quality:
+                    quality_scores.append(quality.score)
+                    if quality.details:
+                        quality_details[sb_path] = quality.details
 
         module_ok = bool(all_results) and all(r.success for r in all_results)
         # When video clips were supplied upstream, require a final deliverable.
@@ -654,6 +674,9 @@ class PipelineController:
                 and all(getattr(r, "final_video_path", None) for r in all_results)
             )
         )
+        quality_score = (
+            sum(quality_scores) / len(quality_scores) if quality_scores else None
+        )
 
         if success:
             project.set_module_state("audio_editing", {
@@ -661,6 +684,8 @@ class PipelineController:
                 "final_video_paths": final_video_paths,
                 "total_duration": total_duration,
             })
+            if quality_score is not None:
+                project.set_quality_score("audio_editing", quality_score, quality_details)
 
         error = None
         if not success:
@@ -675,6 +700,7 @@ class PipelineController:
             "total_duration": total_duration,
             "failed_count": len(all_failed),
             "final_video_paths": final_video_paths,
+            "quality_score": quality_score,
         }
 
     def _report_progress(self, progress: float, message: str):

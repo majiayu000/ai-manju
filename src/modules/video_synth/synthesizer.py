@@ -102,13 +102,15 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
             # 串行处理（视频生成较慢，避免API限制）
             for shot in shots_with_images:
                 try:
-                    # Prefer per-shot storyboard duration over the input default.
+                    # Prefer per-shot storyboard duration over the input default,
+                    # then map to Kling-supported 5s/10s before the provider call.
                     shot_duration = shot.duration if shot.duration else input_data.duration_per_shot
+                    provider_duration = self._normalize_kling_duration(shot_duration)
                     result = await self._generate_shot_video(
                         shot=shot,
                         provider=provider,
                         project_id=input_data.project_id,
-                        duration=shot_duration,
+                        duration=provider_duration,
                         mode=input_data.mode
                     )
                     generated_videos.append(result["info"])
@@ -166,6 +168,12 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
                 success=False,
                 error=str(e)
             )
+
+    @staticmethod
+    def _normalize_kling_duration(duration: float) -> int:
+        """Map arbitrary storyboard durations to Kling-supported 5 or 10 seconds."""
+        value = float(duration) if duration else 5.0
+        return min((5, 10), key=lambda supported: abs(supported - value))
 
     async def _generate_shot_video(
         self,

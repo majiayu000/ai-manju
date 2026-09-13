@@ -130,6 +130,7 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
                         bgm_path=input_data.bgm_path,
                         bgm_volume=input_data.bgm_volume,
                         shot_video_segments=shot_video_segments or None,
+                        mock_mode=input_data.mock_mode,
                     )
                 except Exception as e:
                     compose_error = str(e)
@@ -225,6 +226,7 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
         bgm_path: Optional[str],
         bgm_volume: float,
         shot_video_segments: Optional[list[tuple]] = None,
+        mock_mode: bool = False,
     ) -> str:
         """合成最终视频"""
         # 创建音频到镜头的映射
@@ -237,6 +239,15 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
             ext="mp4",
             suffix="_final"
         )
+
+        # Mock providers write literal placeholder bytes, not valid media.
+        # Skip FFmpeg and emit a placeholder final artifact instead.
+        if mock_mode:
+            self.file_handler.ensure_project_structure(project_id)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_bytes(b"mock final video data")
+            self.logger.info(f"[MOCK] 最终视频占位已写入: {output_path}")
+            return str(output_path)
 
         # 临时目录
         temp_dir = output_path.parent / "temp"

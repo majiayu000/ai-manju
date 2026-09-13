@@ -225,6 +225,127 @@ class TestE2EPipelineMock:
         assert result["success"] is False
         assert result["error"] == "episode 1 provider timeout"
 
+    def test_normalize_kling_duration_maps_fractional_shots(self):
+        """Fractional storyboard durations must map to Kling-supported 5 or 10."""
+        from src.modules.video_synth.synthesizer import VideoSynthModule
+
+        assert VideoSynthModule._normalize_kling_duration(6.7) == 5
+        assert VideoSynthModule._normalize_kling_duration(3.0) == 5
+        assert VideoSynthModule._normalize_kling_duration(8.0) == 10
+        assert VideoSynthModule._normalize_kling_duration(10.0) == 10
+        assert VideoSynthModule._normalize_kling_duration(5.0) == 5
+
+    @pytest.mark.asyncio
+    async def test_mock_audio_compose_skips_ffmpeg(self, monkeypatch, tmp_path):
+        """Mock composition must write a placeholder final video without FFmpeg."""
+        from src.modules.audio_editing.editor import AudioEditingModule
+        from src.models.shot import Shot
+
+        calls = []
+
+        async def boom(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("FFmpeg must not run in mock_mode")
+
+        monkeypatch.setattr(AudioEditingModule, "_merge_video_audio", boom)
+        monkeypatch.setattr(AudioEditingModule, "_concat_videos", boom)
+
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"mock video data")
+        shot = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="mock",
+            duration=5.0,
+            dialogue="你好",
+            video_path=str(clip),
+        )
+
+        module = AudioEditingModule()
+        result = await module._compose_final_video(
+            project_id="proj_mock_compose",
+            episode_id=1,
+            video_paths=[str(clip)],
+            audio_files=[],
+            shots=[shot],
+            add_bgm=False,
+            bgm_path=None,
+            bgm_volume=0.3,
+            shot_video_segments=[(shot, str(clip))],
+            mock_mode=True,
+        )
+
+        assert calls == []
+        assert Path(result).exists()
+        assert Path(result).read_bytes() == b"mock final video data"
+
+    @pytest.mark.asyncio
+    async def test_video_audio_stages_propagate_quality_score(self, monkeypatch):
+        """Video/audio controller stages must expose quality_score like earlier stages."""
+        from types import SimpleNamespace
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig
+        from src.modules.base import QualityMetrics
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(config=PipelineConfig(mock_mode=True))
+        project = Project(
+            id="proj_quality",
+            name="quality",
+            ip_name="quality",
+            config=ProjectConfig(total_episodes=1),
+            project_dir="/tmp/proj_quality",
+            module_states={
+                "storyboard": {"storyboard_paths": ["/tmp/fake_storyboard.json"]},
+                "video_synth": {
+                    "video_paths": ["/tmp/clip.mp4"],
+                    "episode_results": [{
+                        "storyboard_path": "/tmp/fake_storyboard.json",
+                        "video_paths": ["/tmp/clip.mp4"],
+                    }],
+                },
+            },
+        )
+
+        class FakeVideoModule:
+            async def run(self, *args, **kwargs):
+                return SimpleNamespace(
+                    success=True,
+                    error=None,
+                    total_generated=1,
+                    failed_shots=[],
+                    video_paths=["/tmp/clip.mp4"],
+                    merged_video_path=None,
+                    quality=QualityMetrics(score=88.0, details={"ok": 88}, suggestions=[], passed=True),
+                )
+
+        class FakeAudioModule:
+            async def run(self, *args, **kwargs):
+                return SimpleNamespace(
+                    success=True,
+                    error=None,
+                    failed_shots=[],
+                    total_duration=1.0,
+                    final_video_path="/tmp/final.mp4",
+                    quality=QualityMetrics(score=91.0, details={"ok": 91}, suggestions=[], passed=True),
+                )
+
+        controller.modules[PipelineStage.VIDEO_SYNTHESIS] = FakeVideoModule()
+        controller.modules[PipelineStage.AUDIO_EDITING] = FakeAudioModule()
+
+        video_result = await controller._run_video_synthesis(project)
+        audio_result = await controller._run_audio_editing(project)
+
+        assert video_result["success"] is True
+        assert video_result["quality_score"] == 88.0
+        assert project.quality_scores["video_synth"]["score"] == 88.0
+        assert audio_result["success"] is True
+        assert audio_result["quality_score"] == 91.0
+        assert project.quality_scores["audio_editing"]["score"] == 91.0
+
     @pytest.mark.asyncio
     async def test_run_single_module_persists_project(self, monkeypatch, tmp_path):
         """Standalone module success must call save_project for handoff state."""
