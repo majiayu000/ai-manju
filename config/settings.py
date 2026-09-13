@@ -45,6 +45,7 @@ class Settings(BaseSettings):
     xunfei_api_key: str = ""
     xunfei_api_secret: str = ""
     elevenlabs_api_key: str = ""
+    fish_audio_api_key: str = ""
 
     # ==================== 数据库配置 ====================
     database_url: str = "sqlite:///./data/db.sqlite"
