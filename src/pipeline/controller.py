@@ -17,6 +17,12 @@ from src.modules.script_adapter import ScriptAdapterModule, ScriptAdapterInput
 from src.modules.storyboard import StoryboardModule, StoryboardInput
 from src.modules.character import CharacterDesignModule, CharacterDesignInput
 from src.modules.image_gen import ImageGeneratorModule, ImageGenInput
+from src.pipeline.module_keys import (
+    STORAGE_CHARACTER,
+    STORAGE_IMAGE_GEN,
+    STORAGE_SCRIPT_ADAPTER,
+    STORAGE_STORYBOARD,
+)
 from src.utils.file_handler import FileHandler
 from config import settings
 
@@ -321,7 +327,7 @@ class PipelineController:
 
     async def _run_script_adapt(self, project: Project) -> dict:
         """执行剧本改编"""
-        project.update_status(ProjectStatus.SCRIPT_ADAPTING, "script_adapter")
+        project.update_status(ProjectStatus.SCRIPT_ADAPTING, STORAGE_SCRIPT_ADAPTER)
 
         module = self.modules[PipelineStage.SCRIPT_ADAPT]
         input_data = ScriptAdapterInput(
@@ -340,12 +346,12 @@ class PipelineController:
 
         if output.success:
             project.update_status(ProjectStatus.SCRIPT_DONE)
-            project.set_module_state("script_adapter", {
+            project.set_module_state(STORAGE_SCRIPT_ADAPTER, {
                 "script_path": output.script_path,
                 "episodes_count": len(output.script.episodes) if output.script else 0
             })
             if output.quality:
-                project.set_quality_score("script_adapter", output.quality.score, output.quality.details)
+                project.set_quality_score(STORAGE_SCRIPT_ADAPTER, output.quality.score, output.quality.details)
 
         return {
             "success": output.success,
@@ -356,10 +362,10 @@ class PipelineController:
 
     async def _run_storyboard(self, project: Project) -> dict:
         """执行分镜生成"""
-        project.update_status(ProjectStatus.STORYBOARD_GENERATING, "storyboard")
+        project.update_status(ProjectStatus.STORYBOARD_GENERATING, STORAGE_STORYBOARD)
 
         # 获取剧本路径
-        script_state = project.module_states.get("script_adapter", {})
+        script_state = project.module_states.get(STORAGE_SCRIPT_ADAPTER, {})
         script_path = script_state.get("script_path")
 
         if not script_path:
@@ -381,13 +387,13 @@ class PipelineController:
 
         if output.success:
             project.update_status(ProjectStatus.STORYBOARD_DONE)
-            project.set_module_state("storyboard", {
+            project.set_module_state(STORAGE_STORYBOARD, {
                 "storyboard_paths": output.storyboard_paths,
                 "total_shots": output.total_shots,
                 "total_duration": output.total_duration
             })
             if output.quality:
-                project.set_quality_score("storyboard", output.quality.score, output.quality.details)
+                project.set_quality_score(STORAGE_STORYBOARD, output.quality.score, output.quality.details)
 
         return {
             "success": output.success,
@@ -398,10 +404,10 @@ class PipelineController:
 
     async def _run_character_design(self, project: Project) -> dict:
         """执行角色设计"""
-        project.update_status(ProjectStatus.CHARACTER_DESIGNING, "character")
+        project.update_status(ProjectStatus.CHARACTER_DESIGNING, STORAGE_CHARACTER)
 
         # 获取剧本路径
-        script_state = project.module_states.get("script_adapter", {})
+        script_state = project.module_states.get(STORAGE_SCRIPT_ADAPTER, {})
         script_path = script_state.get("script_path")
 
         if not script_path:
@@ -423,12 +429,12 @@ class PipelineController:
 
         if output.success:
             project.update_status(ProjectStatus.CHARACTER_DONE)
-            project.set_module_state("character", {
+            project.set_module_state(STORAGE_CHARACTER, {
                 "design_path": output.design_path,
                 "character_count": output.character_count
             })
             if output.quality:
-                project.set_quality_score("character", output.quality.score, output.quality.details)
+                project.set_quality_score(STORAGE_CHARACTER, output.quality.score, output.quality.details)
 
         return {
             "success": output.success,
@@ -439,11 +445,11 @@ class PipelineController:
 
     async def _run_image_generation(self, project: Project) -> dict:
         """执行图像生成"""
-        project.update_status(ProjectStatus.IMAGE_GENERATING, "image_gen")
+        project.update_status(ProjectStatus.IMAGE_GENERATING, STORAGE_IMAGE_GEN)
 
         # 获取分镜和角色设计路径
-        storyboard_state = project.module_states.get("storyboard", {})
-        character_state = project.module_states.get("character", {})
+        storyboard_state = project.module_states.get(STORAGE_STORYBOARD, {})
+        character_state = project.module_states.get(STORAGE_CHARACTER, {})
 
         storyboard_paths = storyboard_state.get("storyboard_paths", [])
         character_path = character_state.get("design_path")
@@ -485,7 +491,7 @@ class PipelineController:
 
         if success:
             project.update_status(ProjectStatus.IMAGE_DONE)
-            project.set_module_state("image_gen", {
+            project.set_module_state(STORAGE_IMAGE_GEN, {
                 "total_generated": total_generated,
                 "failed_shots": all_failed
             })

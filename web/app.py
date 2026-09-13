@@ -12,6 +12,7 @@ from typing import Optional
 from pathlib import Path
 
 from src.pipeline.controller import PipelineController, PipelineConfig, PipelineStage, PipelineResult
+from src.pipeline.module_keys import known_api_modules, resolve_module_key, resolve_stage_value
 from src.models.project import Project
 from src.utils.logger import setup_logger
 from config import settings
@@ -221,16 +222,13 @@ async def get_pipeline_status(project_id: str):
 @app.post("/api/projects/{project_id}/modules/{module}/run")
 async def run_module(project_id: str, module: str, request: RunModuleRequest):
     """运行单个模块"""
-    stage_map = {
-        "script": PipelineStage.SCRIPT_ADAPT,
-        "storyboard": PipelineStage.STORYBOARD,
-        "character": PipelineStage.CHARACTER_DESIGN,
-        "image": PipelineStage.IMAGE_GENERATION,
-        "video": PipelineStage.VIDEO_SYNTHESIS,
-        "audio": PipelineStage.AUDIO_EDITING,
-    }
+    stage_value = resolve_stage_value(module)
+    if stage_value is None or module not in known_api_modules():
+        raise HTTPException(status_code=400, detail=f"未知模块: {module}")
 
-    if module not in stage_map:
+    try:
+        stage = PipelineStage(stage_value)
+    except ValueError:
         raise HTTPException(status_code=400, detail=f"未知模块: {module}")
 
     try:
@@ -241,7 +239,7 @@ async def run_module(project_id: str, module: str, request: RunModuleRequest):
     config = PipelineConfig(mock_mode=request.mock_mode)
     ctrl = PipelineController(config=config)
 
-    result = await ctrl.run_single_module(project, stage_map[module])
+    result = await ctrl.run_single_module(project, stage)
     return result
 
 
@@ -253,11 +251,13 @@ async def get_module_output(project_id: str, module: str):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="项目不存在")
 
-    module_state = project.module_states.get(module)
-    quality_score = project.quality_scores.get(module)
+    storage_key = resolve_module_key(module)
+    module_state = project.module_states.get(storage_key)
+    quality_score = project.quality_scores.get(storage_key)
 
     return {
         "module": module,
+        "storage_key": storage_key,
         "state": module_state,
         "quality": quality_score
     }
@@ -273,7 +273,7 @@ async def preview_script(project_id: str):
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="项目不存在")
 
-    script_state = project.module_states.get("script_adapter", {})
+    script_state = project.module_states.get(resolve_module_key("script"), {})
     script_path = script_state.get("script_path")
 
     if not script_path or not Path(script_path).exists():
