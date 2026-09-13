@@ -658,9 +658,9 @@ class Settings(BaseSettings):
 - [ ] Module 3: 角色设计
 
 ### Phase 3: 生成模块（Week 4-5）
-- [ ] Module 4: 图像生成
-- [ ] Module 5: 视频合成
-- [ ] Module 6: 配音剪辑
+- [x] Module 4: 图像生成（已接入 `PipelineController`）
+- [x] Module 5: 视频合成（已接入 `PipelineController`；默认跳过以控制 API 成本）
+- [x] Module 6: 配音剪辑（已接入 `PipelineController`；默认跳过以控制 API 成本）
 
 ### Phase 4: Web界面（Week 6）
 - [ ] 项目管理页面

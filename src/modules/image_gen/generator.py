@@ -129,6 +129,13 @@ class ImageGeneratorModule(BaseModule[ImageGenInput, ImageGenOutput]):
 
             self.logger.info(f"图像生成完成: 成功 {len(generated_images)}, 失败 {len(failed_shots)}")
 
+            # Persist image_path onto storyboard so video synthesis can load it
+            if input_data.storyboard_path and storyboard:
+                await self.file_handler.write_json(
+                    input_data.storyboard_path,
+                    storyboard.model_dump(mode="json")
+                )
+
             return ImageGenOutput(
                 success=True,
                 data={

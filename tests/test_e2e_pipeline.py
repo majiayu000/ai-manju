@@ -39,6 +39,54 @@ class TestE2EPipelineMock:
         """
 
     @pytest.mark.asyncio
+    async def test_video_audio_modules_registered_and_not_stubbed(self, monkeypatch):
+        """Video/audio stages must be wired; stubs that claim success are not allowed."""
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig
+        from config import settings as app_settings
+
+        # Controller eagerly constructs LLM-backed modules; stub key for local mock tests.
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        config = PipelineConfig(
+            mock_mode=True,
+            skip_video_synthesis=False,
+            skip_audio_editing=False,
+        )
+        controller = PipelineController(config=config)
+
+        assert PipelineStage.VIDEO_SYNTHESIS in controller.modules
+        assert PipelineStage.AUDIO_EDITING in controller.modules
+
+        project = Project(
+            id="proj_stub_guard",
+            name="stub-guard",
+            ip_name="stub-guard",
+            config=ProjectConfig(total_episodes=1),
+            project_dir="/tmp/proj_stub_guard",
+            module_states={},
+        )
+
+        video_result = await controller._run_video_synthesis(project)
+        audio_result = await controller._run_audio_editing(project)
+
+        stub_markers = ("待实现", "尚未实现")
+        for result, stage in (
+            (video_result, "video"),
+            (audio_result, "audio"),
+        ):
+            message = str(result.get("message", ""))
+            error = str(result.get("error", "") or "")
+            combined = f"{message} {error}"
+            assert not any(marker in combined for marker in stub_markers), (
+                f"{stage} stage still returns stub wording: {result}"
+            )
+            # Missing upstream artifacts must fail, not fake success
+            assert result.get("success") is False, (
+                f"{stage} stage must not report success without inputs: {result}"
+            )
+
+    @pytest.mark.asyncio
     async def test_pipeline_mock_mode(self, sample_ip, tmp_path):
         """测试完整流水线（模拟模式）"""
         # 配置
@@ -98,7 +146,7 @@ class TestE2EPipelineMock:
         )
 
         # 只执行剧本改编
-        result = await controller.run_stage(project, PipelineStage.SCRIPT_ADAPTATION)
+        result = await controller.run_single_module(project, PipelineStage.SCRIPT_ADAPT)
 
         assert result.get("success"), "剧本改编失败"
         print(f"\n[单阶段测试完成]: 质量={result.get('quality_score', 'N/A')}")

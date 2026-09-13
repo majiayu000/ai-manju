@@ -23,9 +23,9 @@ IP原文 → 剧本改编 → 分镜生成 → 角色设计 → 图像生成 →
 | Script Adapter | 将IP原文改编为结构化剧本 | ✅ 完成 |
 | Storyboard Generator | 将剧本转换为分镜脚本 | ✅ 完成 |
 | Character Designer | 为角色生成视觉设计 | ✅ 完成 |
-| Image Generator | 根据分镜生成关键帧（可灵AI） | ✅ 完成 |
-| Video Synthesizer | 图生视频，片段拼接（可灵AI） | ✅ 完成 |
-| Audio Editor | AI配音（Edge TTS），最终合成 | ✅ 完成 |
+| Image Generator | 根据分镜生成关键帧（可灵AI） | ✅ 完成（已接入流水线） |
+| Video Synthesizer | 图生视频，片段拼接（可灵AI） | ✅ 完成（已接入流水线；默认 `skip_video_synthesis=True` 以控制成本） |
+| Audio Editor | AI配音（Edge TTS），最终合成 | ✅ 完成（已接入流水线；默认 `skip_audio_editing=True` 以控制成本） |
 
 ## 快速开始
 

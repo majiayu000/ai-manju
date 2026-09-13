@@ -17,6 +17,8 @@ from src.modules.script_adapter import ScriptAdapterModule, ScriptAdapterInput
 from src.modules.storyboard import StoryboardModule, StoryboardInput
 from src.modules.character import CharacterDesignModule, CharacterDesignInput
 from src.modules.image_gen import ImageGeneratorModule, ImageGenInput
+from src.modules.video_synth import VideoSynthModule, VideoSynthInput
+from src.modules.audio_editing import AudioEditingModule, AudioEditingInput
 from src.utils.file_handler import FileHandler
 from config import settings
 
@@ -96,6 +98,8 @@ class PipelineController:
             PipelineStage.STORYBOARD: StoryboardModule(),
             PipelineStage.CHARACTER_DESIGN: CharacterDesignModule(),
             PipelineStage.IMAGE_GENERATION: ImageGeneratorModule(),
+            PipelineStage.VIDEO_SYNTHESIS: VideoSynthModule(),
+            PipelineStage.AUDIO_EDITING: AudioEditingModule(),
         }
 
         # 回调函数
@@ -482,12 +486,17 @@ class PipelineController:
 
         # 汇总结果
         success = all(r.success for r in all_results)
+        all_image_paths = []
+        for r in all_results:
+            all_image_paths.extend(getattr(r, "image_paths", []) or [])
 
         if success:
             project.update_status(ProjectStatus.IMAGE_DONE)
             project.set_module_state("image_gen", {
                 "total_generated": total_generated,
-                "failed_shots": all_failed
+                "failed_shots": all_failed,
+                "image_paths": all_image_paths,
+                "storyboard_paths": storyboard_paths,
             })
 
         return {
@@ -498,14 +507,135 @@ class PipelineController:
         }
 
     async def _run_video_synthesis(self, project: Project) -> dict:
-        """执行视频合成（待实现）"""
-        self.logger.warning("视频合成模块尚未实现")
-        return {"success": True, "message": "视频合成模块待实现"}
+        """执行视频合成"""
+        project.update_status(ProjectStatus.VIDEO_SYNTHESIZING, "video_synth")
+
+        storyboard_state = project.module_states.get("storyboard", {})
+        storyboard_paths = storyboard_state.get("storyboard_paths", [])
+
+        if not storyboard_paths:
+            return {"success": False, "error": "没有找到分镜文件"}
+
+        module = self.modules[PipelineStage.VIDEO_SYNTHESIS]
+
+        all_results = []
+        total_generated = 0
+        all_failed = []
+        all_video_paths = []
+        episode_results = []
+
+        for sb_path in storyboard_paths:
+            input_data = VideoSynthInput(
+                project_id=project.id,
+                storyboard_path=sb_path,
+                mock_mode=self.config.mock_mode
+            )
+
+            output = await module.run(
+                input_data,
+                min_quality_score=self.config.min_quality_score,
+                max_retries=self.config.max_retries,
+                auto_retry=self.config.auto_retry
+            )
+
+            all_results.append(output)
+            if output.success:
+                total_generated += output.total_generated
+                all_failed.extend(output.failed_shots)
+                all_video_paths.extend(output.video_paths or [])
+                episode_results.append({
+                    "storyboard_path": sb_path,
+                    "video_paths": list(output.video_paths or []),
+                    "merged_video_path": output.merged_video_path,
+                })
+
+        success = all(r.success for r in all_results)
+
+        if success:
+            project.update_status(ProjectStatus.VIDEO_DONE)
+            project.set_module_state("video_synth", {
+                "total_generated": total_generated,
+                "failed_shots": all_failed,
+                "video_paths": all_video_paths,
+                "episode_results": episode_results,
+            })
+
+        return {
+            "success": success,
+            "error": None if success else (all_results[-1].error if all_results else "视频合成失败"),
+            "total_generated": total_generated,
+            "failed_count": len(all_failed),
+            "video_paths": all_video_paths,
+        }
 
     async def _run_audio_editing(self, project: Project) -> dict:
-        """执行配音剪辑（待实现）"""
-        self.logger.warning("配音剪辑模块尚未实现")
-        return {"success": True, "message": "配音剪辑模块待实现"}
+        """执行配音剪辑"""
+        project.update_status(ProjectStatus.AUDIO_EDITING, "audio_editing")
+
+        storyboard_state = project.module_states.get("storyboard", {})
+        video_state = project.module_states.get("video_synth", {})
+
+        storyboard_paths = storyboard_state.get("storyboard_paths", [])
+        if not storyboard_paths:
+            return {"success": False, "error": "没有找到分镜文件"}
+
+        episode_results = video_state.get("episode_results") or []
+        video_paths_by_storyboard = {
+            ep.get("storyboard_path"): ep.get("video_paths", [])
+            for ep in episode_results
+            if ep.get("storyboard_path")
+        }
+        fallback_video_paths = video_state.get("video_paths", [])
+
+        module = self.modules[PipelineStage.AUDIO_EDITING]
+
+        all_results = []
+        all_failed = []
+        final_video_paths = []
+        total_duration = 0.0
+
+        for sb_path in storyboard_paths:
+            video_paths = video_paths_by_storyboard.get(sb_path)
+            if video_paths is None:
+                video_paths = fallback_video_paths if len(storyboard_paths) == 1 else []
+
+            input_data = AudioEditingInput(
+                project_id=project.id,
+                storyboard_path=sb_path,
+                video_paths=video_paths or None,
+                mock_mode=self.config.mock_mode
+            )
+
+            output = await module.run(
+                input_data,
+                min_quality_score=self.config.min_quality_score,
+                max_retries=self.config.max_retries,
+                auto_retry=self.config.auto_retry
+            )
+
+            all_results.append(output)
+            if output.success:
+                all_failed.extend(output.failed_shots)
+                total_duration += output.total_duration or 0.0
+                if output.final_video_path:
+                    final_video_paths.append(output.final_video_path)
+
+        success = all(r.success for r in all_results)
+
+        if success:
+            project.set_module_state("audio_editing", {
+                "failed_shots": all_failed,
+                "final_video_paths": final_video_paths,
+                "total_duration": total_duration,
+            })
+
+        return {
+            "success": success,
+            "error": None if success else (all_results[-1].error if all_results else "配音剪辑失败"),
+            "total_duration": total_duration,
+            "failed_count": len(all_failed),
+            "final_video_paths": final_video_paths,
+        }
 
     def _report_progress(self, progress: float, message: str):
         """报告进度"""

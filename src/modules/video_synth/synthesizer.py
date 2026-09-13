@@ -130,6 +130,13 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
 
             self.logger.info(f"视频合成完成: 成功 {len(generated_videos)}, 失败 {len(failed_shots)}")
 
+            # Persist video_path onto storyboard for downstream audio editing
+            if input_data.storyboard_path and storyboard:
+                await self.file_handler.write_json(
+                    input_data.storyboard_path,
+                    storyboard.model_dump(mode="json")
+                )
+
             return VideoSynthOutput(
                 success=True,
                 data={
