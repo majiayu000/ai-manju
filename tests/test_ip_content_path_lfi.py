@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from config import settings
 from src.models.project import Project
-from src.utils.path_safety import UnsafePathError, resolve_under_root
+from src.utils.path_safety import UnsafePathError, copy_under_root, resolve_under_root
 
 
 @pytest.fixture
@@ -56,6 +56,25 @@ class TestResolveUnderRoot:
         assert resolved == allowed.resolve()
 
 
+class TestCopyUnderRootNoFollow:
+    def test_rejects_symlink_to_outside(self, inputs_dir, tmp_path):
+        secret = tmp_path / "secret.env"
+        secret.write_text("SECRET=1", encoding="utf-8")
+        link = inputs_dir / "innocent.txt"
+        link.symlink_to(secret)
+        dest = tmp_path / "out" / "innocent.txt"
+        with pytest.raises(UnsafePathError):
+            copy_under_root(link, inputs_dir, dest)
+        assert not dest.exists()
+
+    def test_copies_regular_file(self, inputs_dir, tmp_path):
+        src = inputs_dir / "story.txt"
+        src.write_text("safe", encoding="utf-8")
+        dest = tmp_path / "out" / "story.txt"
+        copied = copy_under_root(src, inputs_dir, dest)
+        assert copied.read_text(encoding="utf-8") == "safe"
+
+
 class TestCreateProjectPathPolicy:
     @pytest.mark.asyncio
     async def test_controller_rejects_etc_passwd(self, inputs_dir):
@@ -76,6 +95,19 @@ class TestCreateProjectPathPolicy:
                 await controller.create_project(
                     name="lfi-traversal",
                     ip_content_path=traversal,
+                )
+
+    @pytest.mark.asyncio
+    async def test_controller_rejects_symlink_to_outside(self, inputs_dir, tmp_path):
+        secret = tmp_path / "secret.env"
+        secret.write_text("SECRET=1", encoding="utf-8")
+        link = inputs_dir / "innocent.txt"
+        link.symlink_to(secret)
+        with _controller_without_llm() as controller:
+            with pytest.raises(UnsafePathError):
+                await controller.create_project(
+                    name="lfi-symlink",
+                    ip_content_path=str(link),
                 )
 
     @pytest.mark.asyncio

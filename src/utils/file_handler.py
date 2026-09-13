@@ -1,8 +1,11 @@
 """
 文件处理工具
 """
+import errno
 import json
+import os
 import shutil
+import stat
 from pathlib import Path
 from typing import Any, Optional, Union
 import aiofiles
@@ -96,11 +99,38 @@ class FileHandler:
             json.dump(data, f, ensure_ascii=False, indent=indent)
 
     def copy_file(self, src: Union[str, Path], dst: Union[str, Path]):
-        """复制文件"""
+        """复制文件（源路径使用 O_NOFOLLOW，避免跟随符号链接）"""
         src_path = Path(src)
         dst_path = Path(dst)
         dst_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_path, dst_path)
+
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        if hasattr(os, "O_CLOEXEC"):
+            flags |= os.O_CLOEXEC
+
+        try:
+            fd = os.open(os.fspath(src_path), flags)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", errno.ELOOP)):
+                raise ValueError(f"Refusing to follow symlink when copying: {src_path}") from exc
+            raise
+
+        try:
+            with os.fdopen(fd, "rb") as src_file:
+                fd = -1
+                file_stat = os.fstat(src_file.fileno())
+                if not stat.S_ISREG(file_stat.st_mode):
+                    raise ValueError(f"Source is not a regular file: {src_path}")
+                with open(dst_path, "wb") as dst_file:
+                    shutil.copyfileobj(src_file, dst_file)
+            os.chmod(dst_path, stat.S_IMODE(file_stat.st_mode))
+            os.utime(dst_path, ns=(file_stat.st_atime_ns, file_stat.st_mtime_ns))
+        finally:
+            if fd >= 0:
+                os.close(fd)
+
         self.logger.debug(f"文件已复制: {src_path} -> {dst_path}")
 
     def move_file(self, src: Union[str, Path], dst: Union[str, Path]):
