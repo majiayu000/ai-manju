@@ -30,7 +30,11 @@ async def require_api_key(
         )
 
     provided = (api_key or "").strip()
-    if not provided or not secrets.compare_digest(provided, expected):
+    # compare_digest(str, str) raises TypeError on non-ASCII; compare UTF-8 bytes.
+    if not provided or not secrets.compare_digest(
+        provided.encode("utf-8"),
+        expected.encode("utf-8"),
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid or missing API key",

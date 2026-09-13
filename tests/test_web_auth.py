@@ -4,6 +4,7 @@ Tests for web API key authentication and secure defaults.
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from config import settings
@@ -160,3 +161,29 @@ def test_list_projects_remains_unauthenticated(client):
     response = client.get("/api/projects")
     assert response.status_code == 200
     assert isinstance(response.json(), list)
+
+
+@pytest.mark.asyncio
+async def test_require_api_key_rejects_non_ascii_without_500(monkeypatch):
+    """Non-ASCII secrets/headers must yield 401, not TypeError/500."""
+    monkeypatch.setattr(settings, "api_key", "ascii-secret")
+    with pytest.raises(HTTPException) as exc_info:
+        await require_api_key(api_key="密钥-non-ascii")
+    assert exc_info.value.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_require_api_key_accepts_matching_unicode_secret(monkeypatch):
+    unicode_key = "密钥-unicode-secret"
+    monkeypatch.setattr(settings, "api_key", unicode_key)
+    assert await require_api_key(api_key=unicode_key) == unicode_key
+
+
+def test_env_example_api_key_left_empty():
+    """Sample .env must not ship a usable placeholder API_KEY."""
+    from pathlib import Path
+
+    env_example = Path(__file__).resolve().parents[1] / ".env.example"
+    lines = env_example.read_text(encoding="utf-8").splitlines()
+    api_key_lines = [line for line in lines if line.startswith("API_KEY=")]
+    assert api_key_lines == ["API_KEY="]
