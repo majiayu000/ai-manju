@@ -177,6 +177,23 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
                     total_generated=0,
                 )
 
+            # Partial success must not proceed to audio composition: failed shots
+            # keep video_path=None and would otherwise be silently dropped.
+            if failed_shots:
+                return VideoSynthOutput(
+                    success=False,
+                    error=f"部分镜头视频生成失败: {failed_shots}",
+                    data={
+                        "total_generated": len(generated_videos),
+                        "failed_count": len(failed_shots),
+                    },
+                    generated_videos=generated_videos,
+                    video_paths=video_paths,
+                    total_generated=len(generated_videos),
+                    failed_shots=failed_shots,
+                    merged_video_path=merged_path,
+                )
+
             return VideoSynthOutput(
                 success=True,
                 data={
@@ -277,6 +294,36 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
             "path": str(save_path)
         }
 
+    @staticmethod
+    def _retime_filter_factors(
+        provider_duration: float,
+        target_duration: float,
+    ) -> tuple[float, float]:
+        """Return (setpts_factor, atempo_factor) mapping provider length to target.
+
+        FFmpeg ``setpts=k*PTS`` multiplies video duration by ``k``.
+        FFmpeg ``atempo=k`` divides audio duration by ``k``.
+        Stretching a 5s clip to 6.7s therefore needs
+        ``k_pts = target/provider`` and ``k_tempo = provider/target``.
+        """
+        pts_factor = target_duration / provider_duration
+        tempo = provider_duration / target_duration
+        return pts_factor, tempo
+
+    @staticmethod
+    def _atempo_filter_chain(tempo: float) -> str:
+        """Build an atempo chain clamped to FFmpeg's [0.5, 2.0] per filter."""
+        tempo_filters: list[str] = []
+        remaining = tempo
+        while remaining > 2.0 + 1e-9:
+            tempo_filters.append("atempo=2.0")
+            remaining /= 2.0
+        while remaining < 0.5 - 1e-9:
+            tempo_filters.append("atempo=0.5")
+            remaining /= 0.5
+        tempo_filters.append(f"atempo={remaining:.6f}")
+        return ",".join(tempo_filters)
+
     async def _retime_clip_to_duration(
         self,
         path: Path,
@@ -299,26 +346,21 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
         except OSError:
             return
 
-        import subprocess
         import tempfile
 
-        # setpts factor > 1 slows video (stretch); < 1 speeds it up.
-        pts_factor = provider_duration / target_duration
-        # atempo is inverse of PTS stretch and must stay within [0.5, 2.0].
-        tempo = target_duration / provider_duration
-        tempo_filters = []
-        remaining = tempo
-        while remaining > 2.0 + 1e-9:
-            tempo_filters.append("atempo=2.0")
-            remaining /= 2.0
-        while remaining < 0.5 - 1e-9:
-            tempo_filters.append("atempo=0.5")
-            remaining /= 0.5
-        tempo_filters.append(f"atempo={remaining:.6f}")
-        audio_chain = ",".join(tempo_filters)
+        pts_factor, tempo = self._retime_filter_factors(
+            provider_duration, target_duration
+        )
+        audio_chain = self._atempo_filter_chain(tempo)
 
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+        # Keep the temp file on the same filesystem as `path` so replace is atomic.
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            suffix=".mp4", prefix=f".{path.stem}.retime-", dir=str(path.parent)
+        )
+        import os
+
+        os.close(tmp_fd)
+        tmp_path = Path(tmp_name)
 
         # Prefer A/V retiming; fall back to video-only when the clip has no audio.
         cmd_av = [
@@ -338,19 +380,31 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
             str(tmp_path),
         ]
 
+        replaced = False
         try:
-            proc = subprocess.run(cmd_av, capture_output=True)
+            proc = await asyncio.create_subprocess_exec(
+                *cmd_av,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            _, stderr = await proc.communicate()
             if proc.returncode != 0:
-                proc = subprocess.run(cmd_v, capture_output=True)
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd_v,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                _, stderr = await proc.communicate()
                 if proc.returncode != 0:
-                    err = (proc.stderr or b"").decode(errors="replace")
+                    err = (stderr or b"").decode(errors="replace")
                     raise RuntimeError(f"FFmpeg retime failed: {err}")
-            path.write_bytes(tmp_path.read_bytes())
+            os.replace(tmp_path, path)
+            replaced = True
             self.logger.debug(
                 f"已将片段重定时到 {target_duration}s (provider={provider_duration}s): {path}"
             )
         finally:
-            if tmp_path.exists():
+            if not replaced and tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
 
     def _build_motion_prompt(self, shot: Shot) -> str:

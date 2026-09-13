@@ -139,6 +139,29 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
                     ],
                 )
 
+            # After a partial video run, failed shots keep video_path=None while
+            # siblings still have clips. Shots that still have a keyframe image
+            # are expected to contribute a clip; do not compose around nulls.
+            has_any_clip = any(bool(s.video_path) for s in all_shots)
+            null_clip_shots = [
+                s.shot_id
+                for s in all_shots
+                if has_any_clip
+                and not s.video_path
+                and s.image_path
+                and Path(s.image_path).exists()
+            ]
+            if null_clip_shots:
+                return AudioEditingOutput(
+                    success=False,
+                    error=f"部分镜头缺少视频片段，无法合成: {null_clip_shots}",
+                    audio_files=audio_files,
+                    total_duration=total_duration,
+                    failed_shots=failed_shots + [
+                        sid for sid in null_clip_shots if sid not in failed_shots
+                    ],
+                )
+
             final_video_path = None
             shot_video_segments = [
                 (s, s.video_path)

@@ -235,6 +235,33 @@ class TestE2EPipelineMock:
         assert VideoSynthModule._normalize_kling_duration(10.0) == 10
         assert VideoSynthModule._normalize_kling_duration(5.0) == 5
 
+    def test_retime_filter_factors_stretch_not_compress(self):
+        """setpts/atempo must use target/provider (not the inverse).
+
+        A 5s Kling clip targeting 6.7s must stretch (pts>1, tempo<1). The
+        inverted pair would compress to ~3.73s and this assertion catches it
+        without mocking the retime helper.
+        """
+        from src.modules.video_synth.synthesizer import VideoSynthModule
+
+        pts, tempo = VideoSynthModule._retime_filter_factors(5.0, 6.7)
+        assert abs(pts - (6.7 / 5.0)) < 1e-9
+        assert abs(tempo - (5.0 / 6.7)) < 1e-9
+        assert pts > 1.0
+        assert tempo < 1.0
+        # Inverted (buggy) factors would be the reciprocal pair below.
+        assert abs(pts - (5.0 / 6.7)) > 0.1
+        assert abs(tempo - (6.7 / 5.0)) > 0.1
+
+        chain = VideoSynthModule._atempo_filter_chain(tempo)
+        assert chain.startswith("atempo=")
+        assert "2.0" not in chain  # 5/6.7 is within [0.5, 2.0]
+
+        # Compressing 10s provider down to 6.7s is the opposite direction.
+        pts_fast, tempo_fast = VideoSynthModule._retime_filter_factors(10.0, 6.7)
+        assert pts_fast < 1.0
+        assert tempo_fast > 1.0
+
     @pytest.mark.asyncio
     async def test_generate_shot_video_retimes_to_storyboard_duration(self, monkeypatch, tmp_path):
         """Provider-rounded clips must be retimed back to shot.duration."""
@@ -474,6 +501,141 @@ class TestE2EPipelineMock:
         assert "缺失" in (output.error or "")
         assert 2 in output.failed_shots
         assert output.final_video_path is None
+
+    @pytest.mark.asyncio
+    async def test_audio_compose_fails_when_sibling_clip_is_null(self, tmp_path):
+        """Partial video synth (null video_path) must not compose around missing shots."""
+        from src.modules.audio_editing.editor import AudioEditingModule, AudioEditingInput
+        from src.models.shot import Shot, Storyboard, EpisodeStoryboard
+
+        present = tmp_path / "ok.mp4"
+        present.write_bytes(b"mock video data")
+        img_ok = tmp_path / "ok.png"
+        img_ok.write_bytes(b"img")
+        img_null = tmp_path / "null.png"
+        img_null.write_bytes(b"img")
+        shot_ok = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="ok",
+            duration=5.0,
+            image_path=str(img_ok),
+            video_path=str(present),
+        )
+        shot_null = Shot(
+            shot_id=2,
+            episode_id=1,
+            scene_id=1,
+            description="failed video",
+            duration=5.0,
+            image_path=str(img_null),
+            video_path=None,
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_null_clip",
+            episode_id=1,
+            scenes=[
+                Storyboard(
+                    project_id="proj_null_clip",
+                    episode_id=1,
+                    scene_id=1,
+                    shots=[shot_ok, shot_null],
+                )
+            ],
+        )
+
+        module = AudioEditingModule()
+        output = await module.process(
+            AudioEditingInput(
+                project_id="proj_null_clip",
+                storyboard=storyboard,
+                mock_mode=True,
+                add_bgm=False,
+            )
+        )
+
+        assert output.success is False
+        assert "缺少视频" in (output.error or "")
+        assert 2 in output.failed_shots
+        assert output.final_video_path is None
+
+    @pytest.mark.asyncio
+    async def test_partial_video_synth_fails_when_any_shot_fails(self, monkeypatch, tmp_path):
+        """Any failed shot must make video synth unsuccessful (no silent partial)."""
+        from src.modules.video_synth.synthesizer import VideoSynthModule, VideoSynthInput
+        from src.models.shot import Shot, Storyboard, EpisodeStoryboard
+
+        img1 = tmp_path / "a.png"
+        img2 = tmp_path / "b.png"
+        img1.write_bytes(b"img")
+        img2.write_bytes(b"img")
+        sb_path = tmp_path / "storyboard.json"
+
+        shot_ok = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="ok",
+            duration=5.0,
+            image_path=str(img1),
+        )
+        shot_fail = Shot(
+            shot_id=2,
+            episode_id=1,
+            scene_id=1,
+            description="fail",
+            duration=5.0,
+            image_path=str(img2),
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_partial_video",
+            episode_id=1,
+            scenes=[
+                Storyboard(
+                    project_id="proj_partial_video",
+                    episode_id=1,
+                    scene_id=1,
+                    shots=[shot_ok, shot_fail],
+                )
+            ],
+        )
+        sb_path.write_text(storyboard.model_dump_json())
+
+        call_count = {"n": 0}
+
+        class FlakyProvider:
+            async def image_to_video_and_wait(self, **kwargs):
+                call_count["n"] += 1
+                if call_count["n"] == 1:
+                    return {"video_url": "https://placeholder/ok.mp4", "duration": 5}
+                raise RuntimeError("provider down")
+
+        async def fake_download(self, url, save_path):
+            save_path.parent.mkdir(parents=True, exist_ok=True)
+            save_path.write_bytes(b"mock video data")
+
+        monkeypatch.setattr(
+            "src.modules.video_synth.synthesizer.get_kling_video_provider",
+            lambda mock=False: FlakyProvider(),
+        )
+        monkeypatch.setattr(VideoSynthModule, "_download_video", fake_download)
+
+        module = VideoSynthModule()
+        output = await module.process(
+            VideoSynthInput(
+                project_id="proj_partial_video",
+                storyboard=storyboard,
+                storyboard_path=str(sb_path),
+                mock_mode=True,
+            )
+        )
+
+        assert output.success is False
+        assert 2 in output.failed_shots
+        assert len(output.video_paths) == 1
+        assert shot_fail.video_path is None
+        assert shot_ok.video_path is not None
 
     @pytest.mark.asyncio
     async def test_mock_audio_compose_skips_ffmpeg(self, monkeypatch, tmp_path):
