@@ -2,7 +2,7 @@
 Web API应用
 """
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import Depends, FastAPI, HTTPException, BackgroundTasks
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi.responses import HTMLResponse
@@ -15,6 +15,7 @@ from src.pipeline.controller import PipelineController, PipelineConfig, Pipeline
 from src.models.project import Project
 from src.utils.logger import setup_logger
 from config import settings
+from web.auth import require_api_key
 
 
 # 全局控制器和任务存储
@@ -74,7 +75,7 @@ class RunModuleRequest(BaseModel):
 
 # ==================== 项目管理API ====================
 
-@app.post("/api/projects", response_model=dict)
+@app.post("/api/projects", response_model=dict, dependencies=[Depends(require_api_key)])
 async def create_project(request: CreateProjectRequest):
     """创建新项目"""
     config = PipelineConfig(
@@ -134,7 +135,7 @@ async def get_project(project_id: str):
         raise HTTPException(status_code=404, detail="项目不存在")
 
 
-@app.delete("/api/projects/{project_id}")
+@app.delete("/api/projects/{project_id}", dependencies=[Depends(require_api_key)])
 async def delete_project(project_id: str):
     """删除项目"""
     import shutil
@@ -148,7 +149,10 @@ async def delete_project(project_id: str):
 
 # ==================== 流水线API ====================
 
-@app.post("/api/projects/{project_id}/pipeline/start")
+@app.post(
+    "/api/projects/{project_id}/pipeline/start",
+    dependencies=[Depends(require_api_key)],
+)
 async def start_pipeline(
     project_id: str,
     request: RunPipelineRequest,
@@ -218,7 +222,10 @@ async def get_pipeline_status(project_id: str):
 
 # ==================== 模块API ====================
 
-@app.post("/api/projects/{project_id}/modules/{module}/run")
+@app.post(
+    "/api/projects/{project_id}/modules/{module}/run",
+    dependencies=[Depends(require_api_key)],
+)
 async def run_module(project_id: str, module: str, request: RunModuleRequest):
     """运行单个模块"""
     stage_map = {
@@ -337,10 +344,14 @@ async def index(request: Request):
 
 # ==================== 启动 ====================
 
-def start_server(host: str = "0.0.0.0", port: int = 8000):
-    """启动服务器"""
+def start_server(host: Optional[str] = None, port: Optional[int] = None):
+    """启动服务器（默认使用 settings.host / settings.port）"""
     import uvicorn
-    uvicorn.run(app, host=host, port=port)
+    uvicorn.run(
+        app,
+        host=host if host is not None else settings.host,
+        port=port if port is not None else settings.port,
+    )
 
 
 if __name__ == "__main__":

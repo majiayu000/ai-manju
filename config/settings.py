@@ -51,10 +51,14 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
 
     # ==================== 服务配置 ====================
-    host: str = "0.0.0.0"
+    # Bind to localhost by default; expose explicitly via HOST when needed.
+    host: str = "127.0.0.1"
     port: int = 8000
-    debug: bool = True
+    debug: bool = False
     log_level: str = "INFO"
+    # Shared secret for mutating web API routes (header: X-API-Key).
+    api_key: str = ""
+
 
     # ==================== 质量控制 ====================
     min_quality_score: float = 70.0
