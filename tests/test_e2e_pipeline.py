@@ -647,6 +647,137 @@ class TestE2EPipelineMock:
         assert str(mock_clip) not in merge_inputs
         assert Path(result).exists()
 
+    def test_is_mock_placeholder_size_gate_avoids_full_read(self, tmp_path, monkeypatch):
+        """Large non-mock clips must be rejected by size before reading file body."""
+        from src.modules.audio_editing.editor import AudioEditingModule
+
+        large = tmp_path / "large.mp4"
+        large.write_bytes(b"x" * 1024 * 64)
+
+        opened = {"count": 0}
+        real_open = Path.open
+
+        def counting_open(self, *args, **kwargs):
+            opened["count"] += 1
+            return real_open(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", counting_open)
+        assert AudioEditingModule._is_mock_placeholder_file(str(large)) is False
+        assert opened["count"] == 0
+
+        marker = tmp_path / "mock.mp4"
+        marker.write_bytes(b"mock video data")
+        assert AudioEditingModule._is_mock_placeholder_file(str(marker)) is True
+        assert opened["count"] >= 1
+
+    @pytest.mark.asyncio
+    async def test_failed_video_regen_clears_stale_video_path(self, monkeypatch, tmp_path):
+        """Failed regenerations must clear prior video_path before storyboard persist."""
+        from src.modules.video_synth.synthesizer import VideoSynthModule, VideoSynthInput
+        from src.models.shot import Shot, Storyboard, EpisodeStoryboard
+
+        img = tmp_path / "shot.png"
+        img.write_bytes(b"fake-image")
+        stale = tmp_path / "stale.mp4"
+        stale.write_bytes(b"old clip")
+        sb_path = tmp_path / "storyboard.json"
+
+        shot = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="regen",
+            duration=5.0,
+            image_path=str(img),
+            video_path=str(stale),
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_clear_stale",
+            episode_id=1,
+            scenes=[
+                Storyboard(
+                    project_id="proj_clear_stale",
+                    episode_id=1,
+                    scene_id=1,
+                    shots=[shot],
+                )
+            ],
+        )
+        sb_path.write_text(storyboard.model_dump_json())
+
+        class BoomProvider:
+            async def image_to_video_and_wait(self, **kwargs):
+                raise RuntimeError("provider down")
+
+        monkeypatch.setattr(
+            "src.modules.video_synth.synthesizer.get_kling_video_provider",
+            lambda mock=False: BoomProvider(),
+        )
+
+        module = VideoSynthModule()
+        output = await module.process(
+            VideoSynthInput(
+                project_id="proj_clear_stale",
+                storyboard=storyboard,
+                storyboard_path=str(sb_path),
+                mock_mode=True,
+            )
+        )
+
+        assert shot.video_path is None
+        assert 1 in output.failed_shots
+        persisted = EpisodeStoryboard.model_validate_json(sb_path.read_text())
+        assert persisted.get_all_shots()[0].video_path is None
+
+    @pytest.mark.asyncio
+    async def test_full_pipeline_persists_failed_stage_status(self, monkeypatch, tmp_path):
+        """Full-pipeline stage failure must persist ProjectStatus.FAILED before return."""
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig, ProjectStatus
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(
+            config=PipelineConfig(
+                mock_mode=True,
+                skip_script_adapt=True,
+                skip_storyboard=True,
+                skip_character_design=True,
+                skip_image_generation=True,
+                skip_video_synthesis=False,
+                skip_audio_editing=True,
+            )
+        )
+        project = Project(
+            id="proj_full_fail",
+            name="full-fail",
+            ip_name="full-fail",
+            config=ProjectConfig(total_episodes=1),
+            project_dir=str(tmp_path / "proj_full_fail"),
+            status=ProjectStatus.IMAGE_DONE,
+            module_states={},
+        )
+
+        async def fake_stage(proj, stage):
+            proj.update_status(ProjectStatus.VIDEO_SYNTHESIZING, "video_synth")
+            return {"success": False, "error": "video stage boom"}
+
+        saved = {}
+
+        async def fake_save(proj):
+            saved["status"] = proj.status
+            saved["errors"] = list(proj.errors)
+
+        monkeypatch.setattr(controller, "_execute_stage", fake_stage)
+        monkeypatch.setattr(controller, "save_project", fake_save)
+
+        result = await controller.run_full_pipeline(project)
+        assert result.success is False
+        assert saved["status"] == ProjectStatus.FAILED
+        assert any("video stage boom" in (e.get("error") or "") for e in saved["errors"])
+        assert project.status == ProjectStatus.FAILED
+
     @pytest.mark.asyncio
     async def test_run_single_module_persists_failure(self, monkeypatch, tmp_path):
         """Standalone module failure must save FAILED status and error."""

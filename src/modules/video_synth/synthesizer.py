@@ -107,6 +107,11 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
 
             self.logger.info(f"需要生成 {len(shots_with_images)} 个视频片段")
 
+            # Clear prior video_path before regeneration so a failed shot cannot
+            # leave a stale clip that audio editing would silently compose.
+            for shot in shots_with_images:
+                shot.video_path = None
+
             # 生成视频
             generated_videos = []
             video_paths = []
@@ -131,6 +136,7 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
                     self.logger.info(f"镜头 {shot.shot_id} 视频生成成功")
                 except Exception as e:
                     self.logger.error(f"镜头 {shot.shot_id} 视频生成失败: {e}")
+                    shot.video_path = None
                     failed_shots.append(shot.shot_id)
 
             # 合并视频（如果有多个）

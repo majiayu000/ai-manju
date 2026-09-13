@@ -198,7 +198,11 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
         if not p.exists() or not p.is_file():
             return False
         try:
-            return p.read_bytes() == marker
+            # Size-gate first: real clips are large; avoid full-file I/O/OOM.
+            if p.stat().st_size != len(marker):
+                return False
+            with p.open("rb") as f:
+                return f.read(len(marker)) == marker
         except OSError:
             return False
 

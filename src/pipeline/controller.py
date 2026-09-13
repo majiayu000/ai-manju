@@ -243,6 +243,10 @@ class PipelineController:
                     error_msg = stage_result.get("error", "Unknown error")
                     result.errors.append(f"{stage.value}: {error_msg}")
                     self.logger.error(f"阶段 {stage.value} 失败: {error_msg}")
+                    # Persist FAILED so a reload does not keep the prior success status.
+                    project.add_error(error_msg, module=stage.value)
+                    project.update_status(ProjectStatus.FAILED, stage.value)
+                    await self.save_project(project)
                     break
 
                 result.completed_stages.append(stage)
