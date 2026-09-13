@@ -56,6 +56,10 @@ class TestResolveUnderRoot:
         resolved = resolve_under_root(str(allowed), inputs_dir)
         assert resolved == allowed.resolve()
 
+    def test_rejects_embedded_nul(self, inputs_dir):
+        with pytest.raises(UnsafePathError):
+            resolve_under_root(f"{inputs_dir}/story\0.txt", inputs_dir)
+
 
 class TestCopyUnderRootNoFollow:
     def test_rejects_symlink_to_outside(self, inputs_dir, tmp_path):
@@ -164,6 +168,17 @@ class TestCreateProjectPathPolicy:
         assert copied.read_text(encoding="utf-8") == "allowed content"
 
     @pytest.mark.asyncio
+    async def test_controller_rejects_missing_path(self, inputs_dir):
+        """Missing paths must not be persisted (later symlink plant → LFI)."""
+        missing = inputs_dir / "not-yet.txt"
+        with _controller_without_llm() as controller:
+            with pytest.raises(UnsafePathError, match="not found"):
+                await controller.create_project(
+                    name="missing-path",
+                    ip_content_path=str(missing),
+                )
+
+    @pytest.mark.asyncio
     async def test_controller_ip_content_still_works(self, inputs_dir):
         with _controller_without_llm() as controller:
             project = await controller.create_project(
@@ -253,3 +268,11 @@ class TestWebApiIpContentPathLfi:
         assert resp.status_code == 200
         assert resp.json()["success"] is True
         client._mock_ctrl.create_project.assert_called_once()
+
+    def test_api_rejects_embedded_nul_with_400(self, client, inputs_dir):
+        resp = client.post(
+            "/api/projects",
+            json={"name": "nul-path", "ip_content_path": f"{inputs_dir}/story\0.txt"},
+        )
+        assert resp.status_code == 400
+        client._mock_ctrl.create_project.assert_not_called()

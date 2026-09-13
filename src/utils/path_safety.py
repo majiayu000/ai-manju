@@ -30,7 +30,11 @@ def resolve_under_root(
     when reading or copying untrusted paths.
     """
     root_resolved = Path(root).resolve()
-    candidate = Path(path).expanduser().resolve()
+    try:
+        candidate = Path(path).expanduser().resolve()
+    except ValueError as exc:
+        # e.g. embedded NUL in path → client error, not 500
+        raise UnsafePathError(f"Invalid path under {root_resolved}: {path!r}") from exc
 
     try:
         candidate.relative_to(root_resolved)

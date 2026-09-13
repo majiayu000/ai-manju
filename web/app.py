@@ -89,6 +89,13 @@ async def create_project(request: CreateProjectRequest):
                 status_code=400,
                 detail=f"ip_content_path must be under {settings.inputs_dir}: {exc}",
             ) from exc
+        except ValueError as exc:
+            # Path.resolve() may raise ValueError (e.g. embedded NUL) before
+            # UnsafePathError wrapping; map malformed client input to 400.
+            raise HTTPException(
+                status_code=400,
+                detail=f"ip_content_path must be under {settings.inputs_dir}: {exc}",
+            ) from exc
     elif request.ip_content_path and request.ip_content:
         # Prefer uploaded content; ignore path to avoid LFI when both are set
         safe_ip_content_path = None

@@ -1,6 +1,7 @@
 """
 流水线控制器 - 编排和管理整个生产流程
 """
+import errno
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ from src.modules.storyboard import StoryboardModule, StoryboardInput
 from src.modules.character import CharacterDesignModule, CharacterDesignInput
 from src.modules.image_gen import ImageGeneratorModule, ImageGenInput
 from src.utils.file_handler import FileHandler
-from src.utils.path_safety import copy_under_root
+from src.utils.path_safety import UnsafePathError, copy_under_root
 from config import settings
 
 
@@ -136,12 +137,20 @@ class PipelineController:
             await self.file_handler.write_text(input_path, ip_content)
             ip_content_path = str(input_path)
         elif ip_content_path:
-            # Atomic open-or-NOFOLLOW copy under inputs_dir (closes symlink TOCTOU)
+            # Always copy via openat/O_NOFOLLOW; never persist a missing path
+            # that could later be planted as a symlink under inputs_dir.
             src = Path(ip_content_path).expanduser()
-            if src.exists() or src.is_symlink():
-                dest_path = self.file_handler.get_input_path(project_id, src.name)
+            dest_path = self.file_handler.get_input_path(project_id, src.name)
+            try:
                 copy_under_root(ip_content_path, settings.inputs_dir, dest_path)
-                ip_content_path = str(dest_path)
+            except OSError as exc:
+                if exc.errno == errno.ENOENT:
+                    raise UnsafePathError(
+                        f"IP content path not found under {settings.inputs_dir}: "
+                        f"{ip_content_path}"
+                    ) from exc
+                raise
+            ip_content_path = str(dest_path)
 
         # 创建项目配置
         project_config = ProjectConfig(
