@@ -438,7 +438,7 @@ class CharacterDesignModule(BaseModule[CharacterDesignInput, CharacterDesignOutp
             # 检查一致性相关信息
             if char.consistency_notes:
                 score += 30
-            if char.distinctive_features := char.appearance.distinctive_features:
+            if char.appearance.distinctive_features:
                 score += 40
             if char.reference_description:
                 score += 30

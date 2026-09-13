@@ -18,6 +18,7 @@ from src.modules.storyboard import StoryboardModule, StoryboardInput
 from src.modules.character import CharacterDesignModule, CharacterDesignInput
 from src.modules.image_gen import ImageGeneratorModule, ImageGenInput
 from src.utils.file_handler import FileHandler
+from src.utils.path_safety import resolve_under_root
 from config import settings
 
 
@@ -135,8 +136,8 @@ class PipelineController:
             await self.file_handler.write_text(input_path, ip_content)
             ip_content_path = str(input_path)
         elif ip_content_path:
-            # 复制到项目目录
-            src_path = Path(ip_content_path)
+            # Defense-in-depth: only copy paths contained under inputs_dir
+            src_path = resolve_under_root(ip_content_path, settings.inputs_dir)
             if src_path.exists():
                 dest_path = self.file_handler.get_input_path(project_id, src_path.name)
                 self.file_handler.copy_file(src_path, dest_path)
@@ -163,7 +164,7 @@ class PipelineController:
 
         # 保存项目信息
         project_file = project_dir / "project.json"
-        await self.file_handler.write_json(project_file, project.model_dump())
+        await self.file_handler.write_json(project_file, project.model_dump(mode="json"))
 
         self.logger.info(f"项目创建完成: {project_dir}")
         return project

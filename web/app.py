@@ -14,6 +14,7 @@ from pathlib import Path
 from src.pipeline.controller import PipelineController, PipelineConfig, PipelineStage, PipelineResult
 from src.models.project import Project
 from src.utils.logger import setup_logger
+from src.utils.path_safety import UnsafePathError, resolve_under_root
 from config import settings
 
 
@@ -77,18 +78,38 @@ class RunModuleRequest(BaseModel):
 @app.post("/api/projects", response_model=dict)
 async def create_project(request: CreateProjectRequest):
     """创建新项目"""
+    safe_ip_content_path = None
+    if request.ip_content_path and not request.ip_content:
+        try:
+            safe_ip_content_path = str(
+                resolve_under_root(request.ip_content_path, settings.inputs_dir)
+            )
+        except UnsafePathError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail=f"ip_content_path must be under {settings.inputs_dir}: {exc}",
+            ) from exc
+    elif request.ip_content_path and request.ip_content:
+        # Prefer uploaded content; ignore path to avoid LFI when both are set
+        safe_ip_content_path = None
+
     config = PipelineConfig(
         total_episodes=request.total_episodes,
         art_style=request.art_style
     )
     ctrl = PipelineController(config=config)
 
-    project = await ctrl.create_project(
-        name=request.name,
-        ip_content=request.ip_content,
-        ip_content_path=request.ip_content_path,
-        description=request.description
-    )
+    try:
+        project = await ctrl.create_project(
+            name=request.name,
+            ip_content=request.ip_content,
+            ip_content_path=safe_ip_content_path,
+            description=request.description
+        )
+    except UnsafePathError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return {
         "success": True,
