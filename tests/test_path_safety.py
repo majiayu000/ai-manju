@@ -15,6 +15,9 @@ class TestValidatePathSegment:
         assert validate_path_segment("my_project-01") == "my_project-01"
         assert validate_path_segment("file.png") == "file.png"
         assert validate_path_segment("images") == "images"
+        assert validate_path_segment("故事 原文.txt") == "故事 原文.txt"
+        assert validate_path_segment("file (1).png") == "file (1).png"
+        assert validate_path_segment("weird$chars") == "weird$chars"
 
     @pytest.mark.parametrize(
         "segment",
@@ -26,9 +29,8 @@ class TestValidatePathSegment:
             "../../.env",
             "foo/bar",
             "foo\\bar",
-            "has space",
-            "weird$chars",
             "a/../b",
+            "nul\x00byte",
         ],
     )
     def test_rejects_unsafe_segments(self, segment):
@@ -73,6 +75,38 @@ class TestSafeJoinUnder:
 
         with pytest.raises(UnsafePathError):
             safe_join_under(root, "escape", "file.txt")
+
+    def test_rejects_symlink_to_projects_root(self, tmp_path: Path):
+        root = tmp_path / "projects"
+        root.mkdir()
+        alias = root / "alias"
+        alias.symlink_to(root)
+
+        with pytest.raises(UnsafePathError):
+            safe_join_under(root, "alias")
+
+    def test_rejects_symlink_to_sibling_project(self, tmp_path: Path):
+        root = tmp_path / "projects"
+        sibling = root / "real_proj"
+        sibling.mkdir(parents=True)
+        (sibling / "keep.txt").write_text("keep")
+        alias = root / "alias"
+        alias.symlink_to(sibling)
+
+        with pytest.raises(UnsafePathError):
+            safe_join_under(root, "alias")
+        assert sibling.exists()
+        assert (sibling / "keep.txt").read_text() == "keep"
+
+    def test_accepts_unicode_filename_under_project(self, tmp_path: Path):
+        root = tmp_path / "projects"
+        input_dir = root / "proj1" / "input"
+        input_dir.mkdir(parents=True)
+        name = "故事 原文.txt"
+        (input_dir / name).write_text("body", encoding="utf-8")
+
+        result = safe_join_under(root, "proj1", "input", name)
+        assert result.read_text(encoding="utf-8") == "body"
 
 
 def _build_secured_app(projects_dir: Path) -> FastAPI:
@@ -172,7 +206,7 @@ class TestFileApiPathSafety:
             "/api/projects/demo_proj/files/images/%2e%2e%2e%2e%2f.env",
             "/api/projects/%2e%2e%2f%2e%2e/files/images/x.png",
             "/api/projects/demo_proj/files/%2e%2e/x.png",
-            "/api/projects/bad$id/files/images/x.png",
+            "/api/projects/demo_proj/files/images/%2e%2e%2f%2e%2e%2f.env",
         ],
     )
     def test_get_file_rejects_traversal(self, api_client, url):
@@ -183,6 +217,44 @@ class TestFileApiPathSafety:
         assert resp.content != secret.read_bytes()
         assert secret.exists()
         assert projects.exists()
+
+    def test_get_file_accepts_unicode_filename(self, api_client):
+        client, projects, _secret = api_client
+        name = "故事 原文.txt"
+        target = projects / "demo_proj" / "input"
+        target.mkdir(parents=True, exist_ok=True)
+        (target / name).write_text("story", encoding="utf-8")
+
+        from urllib.parse import quote
+
+        resp = client.get(
+            f"/api/projects/demo_proj/files/input/{quote(name)}"
+        )
+        assert resp.status_code == 200
+        assert resp.content == b"story"
+
+    def test_delete_project_rejects_symlink_to_root(self, api_client):
+        client, projects, _secret = api_client
+        alias = projects / "alias_root"
+        alias.symlink_to(projects)
+
+        resp = client.delete("/api/projects/alias_root")
+        assert resp.status_code in {400, 404}
+        assert projects.exists()
+        assert (projects / "demo_proj").exists()
+
+    def test_delete_project_rejects_symlink_to_sibling(self, api_client):
+        client, projects, _secret = api_client
+        sibling = projects / "sibling_proj"
+        sibling.mkdir()
+        (sibling / "keep.txt").write_text("keep")
+        alias = projects / "alias_sib"
+        alias.symlink_to(sibling)
+
+        resp = client.delete("/api/projects/alias_sib")
+        assert resp.status_code in {400, 404}
+        assert sibling.exists()
+        assert (sibling / "keep.txt").read_text() == "keep"
 
     def test_delete_project_happy_path(self, api_client):
         client, projects, _secret = api_client
