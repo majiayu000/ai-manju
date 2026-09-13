@@ -102,11 +102,13 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
             # 串行处理（视频生成较慢，避免API限制）
             for shot in shots_with_images:
                 try:
+                    # Prefer per-shot storyboard duration over the input default.
+                    shot_duration = shot.duration if shot.duration else input_data.duration_per_shot
                     result = await self._generate_shot_video(
                         shot=shot,
                         provider=provider,
                         project_id=input_data.project_id,
-                        duration=input_data.duration_per_shot,
+                        duration=shot_duration,
                         mode=input_data.mode
                     )
                     generated_videos.append(result["info"])
@@ -135,6 +137,14 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
                 await self.file_handler.write_json(
                     input_data.storyboard_path,
                     storyboard.model_dump(mode="json")
+                )
+
+            if not video_paths:
+                return VideoSynthOutput(
+                    success=False,
+                    error="视频合成未生成任何片段",
+                    failed_shots=failed_shots,
+                    total_generated=0,
                 )
 
             return VideoSynthOutput(

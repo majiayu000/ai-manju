@@ -110,22 +110,41 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
                     self.logger.error(f"镜头 {shot.shot_id} 配音失败: {e}")
                     failed_shots.append(shot.shot_id)
 
-            # 合成最终视频
+            # 合成最终视频 — prefer shot.video_path (shot-keyed) over an unkeyed list
             final_video_path = None
-            if input_data.video_paths:
+            shot_video_segments = [
+                (s, s.video_path)
+                for s in all_shots
+                if s.video_path and Path(s.video_path).exists()
+            ]
+            compose_error = None
+            if shot_video_segments or input_data.video_paths:
                 try:
                     final_video_path = await self._compose_final_video(
                         project_id=input_data.project_id,
                         episode_id=storyboard.episode_id,
-                        video_paths=input_data.video_paths,
+                        video_paths=input_data.video_paths or [],
                         audio_files=audio_files,
                         shots=all_shots,
                         add_bgm=input_data.add_bgm,
                         bgm_path=input_data.bgm_path,
-                        bgm_volume=input_data.bgm_volume
+                        bgm_volume=input_data.bgm_volume,
+                        shot_video_segments=shot_video_segments or None,
                     )
                 except Exception as e:
+                    compose_error = str(e)
                     self.logger.error(f"视频合成失败: {e}")
+
+            # When clips were available, a missing final path is a hard failure.
+            expected_composition = bool(shot_video_segments or input_data.video_paths)
+            if expected_composition and not final_video_path:
+                return AudioEditingOutput(
+                    success=False,
+                    error=compose_error or "配音剪辑未产出最终视频",
+                    audio_files=audio_files,
+                    total_duration=total_duration,
+                    failed_shots=failed_shots,
+                )
 
             self.logger.info(f"配音剪辑完成: 音频 {len(audio_files)}, 失败 {len(failed_shots)}")
 
@@ -204,7 +223,8 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
         shots: list[Shot],
         add_bgm: bool,
         bgm_path: Optional[str],
-        bgm_volume: float
+        bgm_volume: float,
+        shot_video_segments: Optional[list[tuple]] = None,
     ) -> str:
         """合成最终视频"""
         # 创建音频到镜头的映射
@@ -226,12 +246,23 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
             # 步骤1: 为每个视频片段添加对应配音
             processed_videos = []
 
-            for i, video_path in enumerate(video_paths):
-                if not Path(video_path).exists():
-                    continue
+            # Prefer shot-keyed segments from persisted storyboard video_path fields
+            # so missing earlier shots do not shift later clips onto the wrong dialogue.
+            if shot_video_segments:
+                iterable = [
+                    (shot, video_path)
+                    for shot, video_path in shot_video_segments
+                    if video_path and Path(video_path).exists()
+                ]
+            else:
+                iterable = []
+                for i, video_path in enumerate(video_paths):
+                    if not Path(video_path).exists():
+                        continue
+                    shot = shots[i] if i < len(shots) else None
+                    iterable.append((shot, video_path))
 
-                # 查找对应的镜头
-                shot = shots[i] if i < len(shots) else None
+            for i, (shot, video_path) in enumerate(iterable):
                 audio_info = audio_map.get(shot.shot_id) if shot else None
 
                 if audio_info and Path(audio_info["audio_path"]).exists():

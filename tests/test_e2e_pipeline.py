@@ -87,6 +87,182 @@ class TestE2EPipelineMock:
             )
 
     @pytest.mark.asyncio
+    async def test_video_stage_rejects_empty_clips(self, monkeypatch):
+        """Video stage must fail when modules report success with no clips."""
+        from types import SimpleNamespace
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(config=PipelineConfig(mock_mode=True))
+        project = Project(
+            id="proj_empty_clips",
+            name="empty-clips",
+            ip_name="empty-clips",
+            config=ProjectConfig(total_episodes=1),
+            project_dir="/tmp/proj_empty_clips",
+            module_states={
+                "storyboard": {"storyboard_paths": ["/tmp/fake_storyboard.json"]},
+            },
+        )
+
+        class FakeVideoModule:
+            async def run(self, *args, **kwargs):
+                return SimpleNamespace(
+                    success=True,
+                    error=None,
+                    total_generated=0,
+                    failed_shots=[1, 2],
+                    video_paths=[],
+                    merged_video_path=None,
+                )
+
+        controller.modules[PipelineStage.VIDEO_SYNTHESIS] = FakeVideoModule()
+        result = await controller._run_video_synthesis(project)
+        assert result["success"] is False
+        assert "未生成" in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_audio_stage_requires_final_when_video_present(self, monkeypatch):
+        """Audio stage must fail when upstream video exists but no final path."""
+        from types import SimpleNamespace
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(config=PipelineConfig(mock_mode=True))
+        project = Project(
+            id="proj_audio_final",
+            name="audio-final",
+            ip_name="audio-final",
+            config=ProjectConfig(total_episodes=1),
+            project_dir="/tmp/proj_audio_final",
+            module_states={
+                "storyboard": {"storyboard_paths": ["/tmp/fake_storyboard.json"]},
+                "video_synth": {
+                    "video_paths": ["/tmp/clip.mp4"],
+                    "episode_results": [{
+                        "storyboard_path": "/tmp/fake_storyboard.json",
+                        "video_paths": ["/tmp/clip.mp4"],
+                    }],
+                },
+            },
+        )
+
+        class FakeAudioModule:
+            async def run(self, *args, **kwargs):
+                return SimpleNamespace(
+                    success=True,
+                    error=None,
+                    failed_shots=[],
+                    total_duration=1.0,
+                    final_video_path=None,
+                )
+
+        controller.modules[PipelineStage.AUDIO_EDITING] = FakeAudioModule()
+        result = await controller._run_audio_editing(project)
+        assert result["success"] is False
+        assert "最终视频" in (result.get("error") or "")
+
+    @pytest.mark.asyncio
+    async def test_video_error_uses_failed_episode_not_last(self, monkeypatch):
+        """Multi-episode video errors should report the failed episode's message."""
+        from types import SimpleNamespace
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(config=PipelineConfig(mock_mode=True))
+        project = Project(
+            id="proj_multi_ep_err",
+            name="multi-ep-err",
+            ip_name="multi-ep-err",
+            config=ProjectConfig(total_episodes=2),
+            project_dir="/tmp/proj_multi_ep_err",
+            module_states={
+                "storyboard": {
+                    "storyboard_paths": ["/tmp/ep1.json", "/tmp/ep2.json"],
+                },
+            },
+        )
+
+        outputs = [
+            SimpleNamespace(
+                success=False,
+                error="episode 1 provider timeout",
+                total_generated=0,
+                failed_shots=[1],
+                video_paths=[],
+                merged_video_path=None,
+            ),
+            SimpleNamespace(
+                success=True,
+                error=None,
+                total_generated=2,
+                failed_shots=[],
+                video_paths=["/tmp/a.mp4", "/tmp/b.mp4"],
+                merged_video_path="/tmp/merged.mp4",
+            ),
+        ]
+
+        class FakeVideoModule:
+            def __init__(self):
+                self._i = 0
+
+            async def run(self, *args, **kwargs):
+                out = outputs[self._i]
+                self._i += 1
+                return out
+
+        controller.modules[PipelineStage.VIDEO_SYNTHESIS] = FakeVideoModule()
+        result = await controller._run_video_synthesis(project)
+        assert result["success"] is False
+        assert result["error"] == "episode 1 provider timeout"
+
+    @pytest.mark.asyncio
+    async def test_run_single_module_persists_project(self, monkeypatch, tmp_path):
+        """Standalone module success must call save_project for handoff state."""
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(config=PipelineConfig(mock_mode=True))
+        project = Project(
+            id="proj_persist",
+            name="persist",
+            ip_name="persist",
+            config=ProjectConfig(total_episodes=1),
+            project_dir=str(tmp_path / "proj_persist"),
+            module_states={},
+        )
+
+        async def fake_stage(proj, stage):
+            proj.set_module_state("video_synth", {"episode_results": [{"ok": True}]})
+            return {"success": True}
+
+        saved = {"count": 0}
+
+        async def fake_save(proj):
+            saved["count"] += 1
+            saved["state"] = dict(proj.module_states.get("video_synth", {}))
+
+        monkeypatch.setattr(controller, "_execute_stage", fake_stage)
+        monkeypatch.setattr(controller, "save_project", fake_save)
+
+        result = await controller.run_single_module(project, PipelineStage.VIDEO_SYNTHESIS)
+        assert result["success"] is True
+        assert saved["count"] == 1
+        assert saved["state"].get("episode_results")
+
+    @pytest.mark.asyncio
     async def test_pipeline_mock_mode(self, sample_ip, tmp_path):
         """测试完整流水线（模拟模式）"""
         # 配置

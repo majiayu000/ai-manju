@@ -259,6 +259,8 @@ class PipelineController:
                 result.success = True
                 result.current_stage = PipelineStage.COMPLETED
                 project.update_status(ProjectStatus.COMPLETED)
+                # Persist terminal status (loop only saved AUDIO_EDITING before this).
+                await self.save_project(project)
 
             result.completed_at = datetime.now()
             result.duration_seconds = (result.completed_at - result.started_at).total_seconds()
@@ -506,6 +508,17 @@ class PipelineController:
             "failed_count": len(all_failed)
         }
 
+    @staticmethod
+    def _first_stage_error(results, fallback: str) -> str:
+        """Prefer an actionable error from a failed result over the last result."""
+        for result in results:
+            if not getattr(result, "success", False) and getattr(result, "error", None):
+                return result.error
+        for result in results:
+            if getattr(result, "error", None):
+                return result.error
+        return fallback
+
     async def _run_video_synthesis(self, project: Project) -> dict:
         """执行视频合成"""
         project.update_status(ProjectStatus.VIDEO_SYNTHESIZING, "video_synth")
@@ -549,7 +562,18 @@ class PipelineController:
                     "merged_video_path": output.merged_video_path,
                 })
 
-        success = all(r.success for r in all_results)
+        # Module may report success=True with empty video_paths when every clip fails.
+        has_clips = all(
+            bool(getattr(r, "video_paths", None))
+            for r in all_results
+            if getattr(r, "success", False)
+        )
+        success = (
+            bool(all_results)
+            and all(r.success for r in all_results)
+            and has_clips
+            and total_generated > 0
+        )
 
         if success:
             project.update_status(ProjectStatus.VIDEO_DONE)
@@ -560,9 +584,16 @@ class PipelineController:
                 "episode_results": episode_results,
             })
 
+        error = None
+        if not success:
+            if all_results and all(r.success for r in all_results) and not has_clips:
+                error = "视频合成未生成任何片段"
+            else:
+                error = self._first_stage_error(all_results, "视频合成失败")
+
         return {
             "success": success,
-            "error": None if success else (all_results[-1].error if all_results else "视频合成失败"),
+            "error": error,
             "total_generated": total_generated,
             "failed_count": len(all_failed),
             "video_paths": all_video_paths,
@@ -579,13 +610,9 @@ class PipelineController:
         if not storyboard_paths:
             return {"success": False, "error": "没有找到分镜文件"}
 
-        episode_results = video_state.get("episode_results") or []
-        video_paths_by_storyboard = {
-            ep.get("storyboard_path"): ep.get("video_paths", [])
-            for ep in episode_results
-            if ep.get("storyboard_path")
-        }
-        fallback_video_paths = video_state.get("video_paths", [])
+        had_upstream_video = bool(
+            video_state.get("episode_results") or video_state.get("video_paths")
+        )
 
         module = self.modules[PipelineStage.AUDIO_EDITING]
 
@@ -595,14 +622,12 @@ class PipelineController:
         total_duration = 0.0
 
         for sb_path in storyboard_paths:
-            video_paths = video_paths_by_storyboard.get(sb_path)
-            if video_paths is None:
-                video_paths = fallback_video_paths if len(storyboard_paths) == 1 else []
-
+            # Do not pass a filtered unkeyed video_paths list — AudioEditingModule
+            # pairs clips via shot.video_path persisted on the storyboard.
             input_data = AudioEditingInput(
                 project_id=project.id,
                 storyboard_path=sb_path,
-                video_paths=video_paths or None,
+                video_paths=None,
                 mock_mode=self.config.mock_mode
             )
 
@@ -620,7 +645,15 @@ class PipelineController:
                 if output.final_video_path:
                     final_video_paths.append(output.final_video_path)
 
-        success = all(r.success for r in all_results)
+        module_ok = bool(all_results) and all(r.success for r in all_results)
+        # When video clips were supplied upstream, require a final deliverable.
+        success = module_ok and (
+            not had_upstream_video
+            or (
+                len(final_video_paths) == len(all_results)
+                and all(getattr(r, "final_video_path", None) for r in all_results)
+            )
+        )
 
         if success:
             project.set_module_state("audio_editing", {
@@ -629,9 +662,16 @@ class PipelineController:
                 "total_duration": total_duration,
             })
 
+        error = None
+        if not success:
+            if module_ok and had_upstream_video and not final_video_paths:
+                error = "配音剪辑未产出最终视频"
+            else:
+                error = self._first_stage_error(all_results, "配音剪辑失败")
+
         return {
             "success": success,
-            "error": None if success else (all_results[-1].error if all_results else "配音剪辑失败"),
+            "error": error,
             "total_duration": total_duration,
             "failed_count": len(all_failed),
             "final_video_paths": final_video_paths,
@@ -663,7 +703,12 @@ class PipelineController:
             模块运行结果
         """
         self.logger.info(f"单独运行模块: {stage.value}")
-        return await self._execute_stage(project, stage)
+        result = await self._execute_stage(project, stage)
+        # Persist handoff state (e.g. video_synth.episode_results) for later
+        # standalone stages such as audio editing.
+        if result.get("success"):
+            await self.save_project(project)
+        return result
 
     async def evaluate_module_output(
         self,
