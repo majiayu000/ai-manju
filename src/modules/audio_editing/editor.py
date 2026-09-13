@@ -191,19 +191,28 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
         return (shot_or_af.episode_id, shot_or_af.scene_id, shot_or_af.shot_id)
 
     @staticmethod
-    def _has_mock_placeholder_media(paths: list[str]) -> bool:
-        """True when clips are MockKling placeholder bytes (implicit mock without mock_mode)."""
+    def _is_mock_placeholder_file(path: str) -> bool:
+        """True when a single clip is MockKling placeholder bytes."""
         marker = b"mock video data"
+        p = Path(path)
+        if not p.exists() or not p.is_file():
+            return False
+        try:
+            return p.read_bytes() == marker
+        except OSError:
+            return False
+
+    @classmethod
+    def _all_mock_placeholder_media(cls, paths: list[str]) -> bool:
+        """True only when every existing clip is a MockKling placeholder (not any-match)."""
+        existing = []
         for path in paths:
             p = Path(path)
-            if not p.exists() or not p.is_file():
-                continue
-            try:
-                if p.read_bytes() == marker:
-                    return True
-            except OSError:
-                continue
-        return False
+            if p.exists() and p.is_file():
+                existing.append(path)
+        if not existing:
+            return False
+        return all(cls._is_mock_placeholder_file(path) for path in existing)
 
     async def _generate_shot_audio(
         self,
@@ -295,17 +304,35 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
                 shot = shots[i] if i < len(shots) else None
                 iterable.append((shot, video_path))
 
-        # Mock providers (explicit mock_mode or implicit MockKling placeholders)
-        # write literal placeholder bytes, not valid media — skip FFmpeg.
+        # Mock providers write literal placeholder bytes, not valid media.
+        # Bypass FFmpeg only for explicit mock_mode or when EVERY selected clip
+        # is a placeholder — never replace a mixed real+mock episode with mock final.
         paths_for_mock_check = [vp for _, vp in iterable] or list(video_paths or [])
-        if mock_mode or self._has_mock_placeholder_media(paths_for_mock_check):
+        if mock_mode or self._all_mock_placeholder_media(paths_for_mock_check):
             self.file_handler.ensure_project_structure(project_id)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"mock final video data")
             self.logger.info(f"[MOCK] 最终视频占位已写入: {output_path}")
             return str(output_path)
 
+        # Mixed real + stale mock: drop placeholders so FFmpeg only sees real media.
+        if any(self._is_mock_placeholder_file(vp) for _, vp in iterable):
+            real_only = [
+                (shot, vp)
+                for shot, vp in iterable
+                if not self._is_mock_placeholder_file(vp)
+            ]
+            if not real_only:
+                raise Exception("混合片段中无可用真实视频（仅剩 mock 占位）")
+            self.logger.warning(
+                "排除 {} 个 mock 占位片段后继续合成真实视频",
+                len(iterable) - len(real_only),
+            )
+            iterable = real_only
+
         # 临时目录
+        self.file_handler.ensure_project_structure(project_id)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         temp_dir = output_path.parent / "temp"
         temp_dir.mkdir(exist_ok=True)
 

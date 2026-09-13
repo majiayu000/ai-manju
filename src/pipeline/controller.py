@@ -554,9 +554,11 @@ class PipelineController:
             )
 
             all_results.append(output)
+            # Aggregate failure metadata even when the episode returns success=False
+            # (e.g. every shot failed) so stage failed_count stays accurate.
+            all_failed.extend(getattr(output, "failed_shots", None) or [])
             if output.success:
                 total_generated += output.total_generated
-                all_failed.extend(output.failed_shots)
                 all_video_paths.extend(output.video_paths or [])
                 episode_results.append({
                     "storyboard_path": sb_path,
@@ -654,8 +656,9 @@ class PipelineController:
             )
 
             all_results.append(output)
+            # Aggregate failure metadata independently of episode success.
+            all_failed.extend(getattr(output, "failed_shots", None) or [])
             if output.success:
-                all_failed.extend(output.failed_shots)
                 total_duration += output.total_duration or 0.0
                 if output.final_video_path:
                     final_video_paths.append(output.final_video_path)
@@ -733,10 +736,13 @@ class PipelineController:
         """
         self.logger.info(f"单独运行模块: {stage.value}")
         result = await self._execute_stage(project, stage)
-        # Persist handoff state (e.g. video_synth.episode_results) for later
-        # standalone stages such as audio editing.
-        if result.get("success"):
-            await self.save_project(project)
+        # Persist handoff state on success, and failed status/error on failure so
+        # a reload does not hide VIDEO_SYNTHESIZING/AUDIO_EDITING attempts.
+        if not result.get("success"):
+            error_msg = result.get("error") or "模块运行失败"
+            project.add_error(error_msg, module=stage.value)
+            project.update_status(ProjectStatus.FAILED, stage.value)
+        await self.save_project(project)
         return result
 
     async def evaluate_module_output(

@@ -597,6 +597,157 @@ class TestE2EPipelineMock:
         assert Path(result).read_bytes() == b"mock final video data"
 
     @pytest.mark.asyncio
+    async def test_compose_excludes_stale_mock_from_mixed_clips(self, monkeypatch, tmp_path):
+        """Mixed real+mock clips must not replace the episode with mock final bytes."""
+        from src.modules.audio_editing.editor import AudioEditingModule
+        from src.models.shot import Shot
+
+        merge_inputs = []
+
+        async def fake_merge(self, video_path, audio_path, output_path):
+            merge_inputs.append(video_path)
+            Path(output_path).write_bytes(b"merged-real")
+
+        async def fake_concat(self, video_paths, output_path):
+            Path(output_path).write_bytes(b"concat-real")
+
+        monkeypatch.setattr(AudioEditingModule, "_merge_video_audio", fake_merge)
+        monkeypatch.setattr(AudioEditingModule, "_concat_videos", fake_concat)
+
+        mock_clip = tmp_path / "stale_mock.mp4"
+        real_clip = tmp_path / "real.mp4"
+        mock_clip.write_bytes(b"mock video data")
+        real_clip.write_bytes(b"real video bytes that are not mock")
+
+        mock_shot = Shot(
+            shot_id=1, episode_id=1, scene_id=1, description="stale", duration=5.0,
+            video_path=str(mock_clip),
+        )
+        real_shot = Shot(
+            shot_id=2, episode_id=1, scene_id=1, description="real", duration=5.0,
+            dialogue="你好",
+            video_path=str(real_clip),
+        )
+
+        module = AudioEditingModule()
+        result = await module._compose_final_video(
+            project_id="proj_mixed_compose",
+            episode_id=1,
+            video_paths=[str(mock_clip), str(real_clip)],
+            audio_files=[],
+            shots=[mock_shot, real_shot],
+            add_bgm=False,
+            bgm_path=None,
+            bgm_volume=0.3,
+            shot_video_segments=[(mock_shot, str(mock_clip)), (real_shot, str(real_clip))],
+            mock_mode=False,
+        )
+
+        assert Path(result).read_bytes() != b"mock final video data"
+        assert str(mock_clip) not in merge_inputs
+        assert Path(result).exists()
+
+    @pytest.mark.asyncio
+    async def test_run_single_module_persists_failure(self, monkeypatch, tmp_path):
+        """Standalone module failure must save FAILED status and error."""
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig, ProjectStatus
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(config=PipelineConfig(mock_mode=True))
+        project = Project(
+            id="proj_persist_fail",
+            name="persist-fail",
+            ip_name="persist-fail",
+            config=ProjectConfig(total_episodes=1),
+            project_dir=str(tmp_path / "proj_persist_fail"),
+            module_states={},
+        )
+
+        async def fake_stage(proj, stage):
+            proj.update_status(ProjectStatus.VIDEO_SYNTHESIZING, "video_synth")
+            return {"success": False, "error": "provider timeout"}
+
+        saved = {}
+
+        async def fake_save(proj):
+            saved["status"] = proj.status
+            saved["errors"] = list(proj.errors)
+
+        monkeypatch.setattr(controller, "_execute_stage", fake_stage)
+        monkeypatch.setattr(controller, "save_project", fake_save)
+
+        result = await controller.run_single_module(project, PipelineStage.VIDEO_SYNTHESIS)
+        assert result["success"] is False
+        assert saved["status"] == ProjectStatus.FAILED
+        assert any("provider timeout" in (e.get("error") or "") for e in saved["errors"])
+
+    @pytest.mark.asyncio
+    async def test_failed_episode_failed_shots_count_in_totals(self, monkeypatch):
+        """failed_shots on success=False episodes must still appear in failed_count."""
+        from types import SimpleNamespace
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(config=PipelineConfig(mock_mode=True))
+        project = Project(
+            id="proj_fail_totals",
+            name="fail-totals",
+            ip_name="fail-totals",
+            config=ProjectConfig(total_episodes=1),
+            project_dir="/tmp/proj_fail_totals",
+            module_states={
+                "storyboard": {"storyboard_paths": ["/tmp/fake_storyboard.json"]},
+                "video_synth": {
+                    "video_paths": ["/tmp/clip.mp4"],
+                    "episode_results": [{
+                        "storyboard_path": "/tmp/fake_storyboard.json",
+                        "video_paths": ["/tmp/clip.mp4"],
+                    }],
+                },
+            },
+        )
+
+        class FakeVideoModule:
+            async def run(self, *args, **kwargs):
+                return SimpleNamespace(
+                    success=False,
+                    error="all clips failed",
+                    total_generated=0,
+                    failed_shots=[1, 2, 3],
+                    video_paths=[],
+                    merged_video_path=None,
+                    quality=None,
+                )
+
+        class FakeAudioModule:
+            async def run(self, *args, **kwargs):
+                return SimpleNamespace(
+                    success=False,
+                    error="tts down",
+                    failed_shots=[7, 8],
+                    total_duration=0.0,
+                    final_video_path=None,
+                    quality=None,
+                )
+
+        controller.modules[PipelineStage.VIDEO_SYNTHESIS] = FakeVideoModule()
+        controller.modules[PipelineStage.AUDIO_EDITING] = FakeAudioModule()
+
+        video_result = await controller._run_video_synthesis(project)
+        audio_result = await controller._run_audio_editing(project)
+
+        assert video_result["success"] is False
+        assert video_result["failed_count"] == 3
+        assert audio_result["success"] is False
+        assert audio_result["failed_count"] == 2
+
+    @pytest.mark.asyncio
     async def test_pipeline_mock_mode(self, sample_ip, tmp_path):
         """测试完整流水线（模拟模式）"""
         # 配置
