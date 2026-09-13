@@ -14,6 +14,7 @@ from pathlib import Path
 from src.pipeline.controller import PipelineController, PipelineConfig, PipelineStage, PipelineResult
 from src.models.project import Project
 from src.utils.logger import setup_logger
+from src.utils.path_safety import UnsafePathError, safe_join_under
 from config import settings
 
 
@@ -138,7 +139,10 @@ async def get_project(project_id: str):
 async def delete_project(project_id: str):
     """删除项目"""
     import shutil
-    project_dir = settings.projects_dir / project_id
+    try:
+        project_dir = safe_join_under(settings.projects_dir, project_id)
+    except UnsafePathError:
+        raise HTTPException(status_code=400, detail="无效的项目路径")
     if not project_dir.exists():
         raise HTTPException(status_code=404, detail="项目不存在")
 
@@ -289,7 +293,10 @@ async def preview_script(project_id: str):
 @app.get("/api/projects/{project_id}/preview/images")
 async def preview_images(project_id: str, episode: int = 1):
     """预览图像"""
-    project_dir = settings.projects_dir / project_id / "images"
+    try:
+        project_dir = safe_join_under(settings.projects_dir, project_id, "images")
+    except UnsafePathError:
+        raise HTTPException(status_code=400, detail="无效的项目路径")
     if not project_dir.exists():
         return {"images": []}
 
@@ -310,7 +317,12 @@ async def get_file(project_id: str, category: str, filename: str):
     """获取项目文件"""
     from fastapi.responses import FileResponse
 
-    file_path = settings.projects_dir / project_id / category / filename
+    try:
+        file_path = safe_join_under(
+            settings.projects_dir, project_id, category, filename
+        )
+    except UnsafePathError:
+        raise HTTPException(status_code=400, detail="无效的文件路径")
     if not file_path.exists():
         raise HTTPException(status_code=404, detail="文件不存在")
 
