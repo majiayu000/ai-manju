@@ -9,7 +9,10 @@ from pydantic import Field
 
 from src.modules.base import BaseModule, ModuleInput, ModuleOutput, QualityMetrics
 from src.models.shot import Shot, EpisodeStoryboard
-from src.modules.video_synth.providers.kling import get_kling_video_provider
+from src.modules.video_synth.providers.kling import (
+    MockKlingVideoProvider,
+    get_kling_video_provider,
+)
 from src.utils.file_handler import FileHandler
 from config import settings
 
@@ -75,6 +78,16 @@ class VideoSynthModule(BaseModule[VideoSynthInput, VideoSynthOutput]):
 
             # 获取视频提供商
             provider = get_kling_video_provider(mock=input_data.mock_mode)
+            # Missing Kling key silently returns MockKling even when mock_mode=False;
+            # refuse that path so placeholder bytes are never treated as real clips.
+            if (
+                not input_data.mock_mode
+                and isinstance(provider, MockKlingVideoProvider)
+            ):
+                return VideoSynthOutput(
+                    success=False,
+                    error="Kling API key未配置，无法进行真实视频合成（请设置 kling_api_key 或启用 mock_mode）",
+                )
 
             # 收集要处理的镜头
             all_shots = storyboard.get_all_shots()

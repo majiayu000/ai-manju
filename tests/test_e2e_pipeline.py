@@ -384,6 +384,219 @@ class TestE2EPipelineMock:
         assert saved["state"].get("episode_results")
 
     @pytest.mark.asyncio
+    async def test_audio_lookup_key_includes_scene(self):
+        """Audio map must use episode/scene/shot so multi-scene shot_ids do not collide."""
+        from src.modules.audio_editing.editor import AudioEditingModule
+        from src.models.shot import Shot
+
+        shot_a = Shot(
+            shot_id=1, episode_id=1, scene_id=1, description="a", duration=5.0
+        )
+        shot_b = Shot(
+            shot_id=1, episode_id=1, scene_id=2, description="b", duration=5.0
+        )
+        af_a = {"shot_id": 1, "episode_id": 1, "scene_id": 1, "audio_path": "/a.mp3"}
+        af_b = {"shot_id": 1, "episode_id": 1, "scene_id": 2, "audio_path": "/b.mp3"}
+
+        key_a = AudioEditingModule._audio_lookup_key(shot_a)
+        key_b = AudioEditingModule._audio_lookup_key(shot_b)
+        assert key_a != key_b
+        audio_map = {
+            AudioEditingModule._audio_lookup_key(af): af for af in (af_a, af_b)
+        }
+        assert audio_map[key_a]["audio_path"] == "/a.mp3"
+        assert audio_map[key_b]["audio_path"] == "/b.mp3"
+
+    @pytest.mark.asyncio
+    async def test_standalone_audio_persists_completed_status(self, monkeypatch, tmp_path):
+        """Successful standalone AUDIO_EDITING must save COMPLETED, not AUDIO_EDITING."""
+        from types import SimpleNamespace
+        from src.pipeline.controller import PipelineStage
+        from src.models.project import Project, ProjectConfig, ProjectStatus
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "claude_api_key", "test-key-for-mock")
+
+        controller = PipelineController(config=PipelineConfig(mock_mode=True))
+        project = Project(
+            id="proj_audio_terminal",
+            name="audio-terminal",
+            ip_name="audio-terminal",
+            config=ProjectConfig(total_episodes=1),
+            project_dir=str(tmp_path / "proj_audio_terminal"),
+            module_states={
+                "storyboard": {"storyboard_paths": ["/tmp/fake_storyboard.json"]},
+                "video_synth": {
+                    "video_paths": ["/tmp/clip.mp4"],
+                    "episode_results": [{
+                        "storyboard_path": "/tmp/fake_storyboard.json",
+                        "video_paths": ["/tmp/clip.mp4"],
+                    }],
+                },
+            },
+        )
+
+        class FakeAudioModule:
+            async def run(self, *args, **kwargs):
+                return SimpleNamespace(
+                    success=True,
+                    error=None,
+                    failed_shots=[],
+                    total_duration=1.0,
+                    final_video_path="/tmp/final.mp4",
+                    quality=None,
+                )
+
+        controller.modules[PipelineStage.AUDIO_EDITING] = FakeAudioModule()
+
+        saved = {}
+
+        async def fake_save(proj):
+            saved["status"] = proj.status
+
+        monkeypatch.setattr(controller, "save_project", fake_save)
+
+        result = await controller.run_single_module(project, PipelineStage.AUDIO_EDITING)
+        assert result["success"] is True
+        assert project.status == ProjectStatus.COMPLETED
+        assert saved["status"] == ProjectStatus.COMPLETED
+
+    @pytest.mark.asyncio
+    async def test_audio_module_fails_when_all_tts_fail(self, monkeypatch, tmp_path):
+        """When every dialogue TTS request fails, module must return success=False."""
+        from src.modules.audio_editing.editor import AudioEditingModule, AudioEditingInput
+        from src.models.shot import Shot, EpisodeStoryboard, Storyboard
+
+        shot = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="d",
+            duration=5.0,
+            dialogue="你好世界",
+            video_path=str(tmp_path / "clip.mp4"),
+        )
+        (tmp_path / "clip.mp4").write_bytes(b"mock video data")
+        scene = Storyboard(
+            project_id="proj_tts_fail",
+            episode_id=1,
+            scene_id=1,
+            shots=[shot],
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_tts_fail",
+            episode_id=1,
+            scenes=[scene],
+        )
+
+        class BoomTTS:
+            async def synthesize(self, *args, **kwargs):
+                raise RuntimeError("tts down")
+
+        monkeypatch.setattr(
+            "src.modules.audio_editing.editor.get_tts_provider",
+            lambda **kwargs: BoomTTS(),
+        )
+
+        module = AudioEditingModule()
+        output = await module.process(
+            AudioEditingInput(
+                project_id="proj_tts_fail",
+                storyboard=storyboard,
+                mock_mode=True,
+            )
+        )
+        assert output.success is False
+        assert "配音合成全部失败" in (output.error or "")
+        assert 1 in output.failed_shots
+
+    @pytest.mark.asyncio
+    async def test_implicit_mock_kling_rejected_without_mock_mode(self, monkeypatch, tmp_path):
+        """Missing Kling key must not silently succeed with MockKling when mock_mode=False."""
+        from src.modules.video_synth.synthesizer import VideoSynthModule, VideoSynthInput
+        from src.models.shot import Shot, EpisodeStoryboard, Storyboard
+        from config import settings as app_settings
+
+        monkeypatch.setattr(app_settings, "kling_api_key", "")
+
+        img = tmp_path / "implicit_mock_shot.png"
+        img.write_bytes(b"fake")
+        shot = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="d",
+            duration=5.0,
+            image_path=str(img),
+        )
+        scene = Storyboard(
+            project_id="proj_implicit_mock",
+            episode_id=1,
+            scene_id=1,
+            shots=[shot],
+        )
+        storyboard = EpisodeStoryboard(
+            project_id="proj_implicit_mock",
+            episode_id=1,
+            scenes=[scene],
+        )
+
+        module = VideoSynthModule()
+        output = await module.process(
+            VideoSynthInput(
+                project_id="proj_implicit_mock",
+                storyboard=storyboard,
+                mock_mode=False,
+            )
+        )
+        assert output.success is False
+        assert "API key" in (output.error or "") or "kling" in (output.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_compose_skips_ffmpeg_for_placeholder_bytes(self, monkeypatch, tmp_path):
+        """Implicit mock placeholder clips must bypass FFmpeg even when mock_mode=False."""
+        from src.modules.audio_editing.editor import AudioEditingModule
+        from src.models.shot import Shot
+
+        calls = []
+
+        async def boom(*args, **kwargs):
+            calls.append(args)
+            raise AssertionError("FFmpeg must not run on placeholder media")
+
+        monkeypatch.setattr(AudioEditingModule, "_merge_video_audio", boom)
+        monkeypatch.setattr(AudioEditingModule, "_concat_videos", boom)
+
+        clip = tmp_path / "clip.mp4"
+        clip.write_bytes(b"mock video data")
+        shot = Shot(
+            shot_id=1,
+            episode_id=1,
+            scene_id=1,
+            description="mock",
+            duration=5.0,
+            video_path=str(clip),
+        )
+
+        module = AudioEditingModule()
+        result = await module._compose_final_video(
+            project_id="proj_placeholder_compose",
+            episode_id=1,
+            video_paths=[str(clip)],
+            audio_files=[],
+            shots=[shot],
+            add_bgm=False,
+            bgm_path=None,
+            bgm_volume=0.3,
+            shot_video_segments=[(shot, str(clip))],
+            mock_mode=False,
+        )
+
+        assert calls == []
+        assert Path(result).exists()
+        assert Path(result).read_bytes() == b"mock final video data"
+
+    @pytest.mark.asyncio
     async def test_pipeline_mock_mode(self, sample_ip, tmp_path):
         """测试完整流水线（模拟模式）"""
         # 配置

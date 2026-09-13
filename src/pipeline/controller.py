@@ -679,6 +679,9 @@ class PipelineController:
         )
 
         if success:
+            # Terminal status so standalone run_single_module saves do not leave
+            # the project stuck in non-terminal AUDIO_EDITING indefinitely.
+            project.update_status(ProjectStatus.COMPLETED)
             project.set_module_state("audio_editing", {
                 "failed_shots": all_failed,
                 "final_video_paths": final_video_paths,

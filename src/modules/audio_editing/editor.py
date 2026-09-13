@@ -110,6 +110,16 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
                     self.logger.error(f"镜头 {shot.shot_id} 配音失败: {e}")
                     failed_shots.append(shot.shot_id)
 
+            # All requested dialogue TTS failed — do not compose a silent "success".
+            if shots_with_dialogue and not audio_files:
+                return AudioEditingOutput(
+                    success=False,
+                    error="配音合成全部失败",
+                    audio_files=audio_files,
+                    total_duration=total_duration,
+                    failed_shots=failed_shots,
+                )
+
             # 合成最终视频 — prefer shot.video_path (shot-keyed) over an unkeyed list
             final_video_path = None
             shot_video_segments = [
@@ -168,6 +178,32 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
                 success=False,
                 error=str(e)
             )
+
+    @staticmethod
+    def _audio_lookup_key(shot_or_af) -> tuple:
+        """Episode/scene/shot identity so multi-scene shot_id reuse does not collide."""
+        if isinstance(shot_or_af, dict):
+            return (
+                shot_or_af.get("episode_id"),
+                shot_or_af.get("scene_id"),
+                shot_or_af.get("shot_id"),
+            )
+        return (shot_or_af.episode_id, shot_or_af.scene_id, shot_or_af.shot_id)
+
+    @staticmethod
+    def _has_mock_placeholder_media(paths: list[str]) -> bool:
+        """True when clips are MockKling placeholder bytes (implicit mock without mock_mode)."""
+        marker = b"mock video data"
+        for path in paths:
+            p = Path(path)
+            if not p.exists() or not p.is_file():
+                continue
+            try:
+                if p.read_bytes() == marker:
+                    return True
+            except OSError:
+                continue
+        return False
 
     async def _generate_shot_audio(
         self,
@@ -229,8 +265,11 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
         mock_mode: bool = False,
     ) -> str:
         """合成最终视频"""
-        # 创建音频到镜头的映射
-        audio_map = {af["shot_id"]: af for af in audio_files}
+        # Composite key: shot_id alone collides across scenes in multi-scene episodes.
+        audio_map = {
+            self._audio_lookup_key(af): af
+            for af in audio_files
+        }
 
         # 输出路径
         output_path = self.file_handler.get_video_path(
@@ -240,9 +279,26 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
             suffix="_final"
         )
 
-        # Mock providers write literal placeholder bytes, not valid media.
-        # Skip FFmpeg and emit a placeholder final artifact instead.
-        if mock_mode:
+        # Prefer shot-keyed segments from persisted storyboard video_path fields
+        # so missing earlier shots do not shift later clips onto the wrong dialogue.
+        if shot_video_segments:
+            iterable = [
+                (shot, video_path)
+                for shot, video_path in shot_video_segments
+                if video_path and Path(video_path).exists()
+            ]
+        else:
+            iterable = []
+            for i, video_path in enumerate(video_paths):
+                if not Path(video_path).exists():
+                    continue
+                shot = shots[i] if i < len(shots) else None
+                iterable.append((shot, video_path))
+
+        # Mock providers (explicit mock_mode or implicit MockKling placeholders)
+        # write literal placeholder bytes, not valid media — skip FFmpeg.
+        paths_for_mock_check = [vp for _, vp in iterable] or list(video_paths or [])
+        if mock_mode or self._has_mock_placeholder_media(paths_for_mock_check):
             self.file_handler.ensure_project_structure(project_id)
             output_path.parent.mkdir(parents=True, exist_ok=True)
             output_path.write_bytes(b"mock final video data")
@@ -257,24 +313,10 @@ class AudioEditingModule(BaseModule[AudioEditingInput, AudioEditingOutput]):
             # 步骤1: 为每个视频片段添加对应配音
             processed_videos = []
 
-            # Prefer shot-keyed segments from persisted storyboard video_path fields
-            # so missing earlier shots do not shift later clips onto the wrong dialogue.
-            if shot_video_segments:
-                iterable = [
-                    (shot, video_path)
-                    for shot, video_path in shot_video_segments
-                    if video_path and Path(video_path).exists()
-                ]
-            else:
-                iterable = []
-                for i, video_path in enumerate(video_paths):
-                    if not Path(video_path).exists():
-                        continue
-                    shot = shots[i] if i < len(shots) else None
-                    iterable.append((shot, video_path))
-
             for i, (shot, video_path) in enumerate(iterable):
-                audio_info = audio_map.get(shot.shot_id) if shot else None
+                audio_info = (
+                    audio_map.get(self._audio_lookup_key(shot)) if shot else None
+                )
 
                 if audio_info and Path(audio_info["audio_path"]).exists():
                     # 合并视频和音频
